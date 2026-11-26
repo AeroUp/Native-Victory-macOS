@@ -784,7 +784,12 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
 }
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
-    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+    with_list(this, |t, l| {
+        if std::env::var_os("VICTORY_TRACE_DISPATCH").is_some() {
+            // With the command buffer's slow-dispatch log this names a shader that runs seconds.
+            tracing::info!(x, y, z, pipeline = format_args!("{:#x}", l.pipeline), "dispatch");
+        }
+        match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
@@ -792,6 +797,7 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
             }
         }
         _ => dropped("a dispatch without a host compute pipeline"),
+        }
     });
 }
 

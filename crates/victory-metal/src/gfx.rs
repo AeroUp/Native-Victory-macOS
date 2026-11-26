@@ -98,6 +98,7 @@ impl Texture {
 #[derive(Clone, Copy)]
 enum Op {
     Compute { groups: [usize; 3], threads: [usize; 3] },
+    Render { draws: usize, w: u32, h: u32, geometry: u64 },
 }
 
 static OPS: std::sync::Mutex<Vec<Op>> = std::sync::Mutex::new(Vec::new());
@@ -926,6 +927,7 @@ impl GraphicsBackend for Metal {
                             *groups,
                             *threads,
                         )),
+                        Op::Render { .. } => None,
                     })
                     .collect();
                 largest.sort_by_key(|e| std::cmp::Reverse(e.0));
@@ -934,9 +936,19 @@ impl GraphicsBackend for Metal {
                     .take(6)
                     .map(|(n, g, t)| format!("{n} invocations g={g:?} t={t:?}"))
                     .collect();
+                let render: Vec<String> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Render { draws, w, h, geometry } => {
+                            Some(format!("{draws} draws {w}x{h} {geometry} primitives"))
+                        }
+                        Op::Compute { .. } => None,
+                    })
+                    .collect();
                 eprintln!(
-                    "metal: command buffer {ms} ms, {} dispatches, largest {top:?}",
-                    ops.len()
+                    "metal: command buffer {ms} ms, {} dispatches, largest {top:?}, {} render passes {render:?}",
+                    ops.iter().filter(|o| matches!(o, Op::Compute { .. })).count(),
+                    render.len()
                 );
             }
             if let Some(e) = done.error()
@@ -1113,6 +1125,27 @@ impl Metal {
             .map(|c| &c.texture.tex)
             .or(rp.depth.as_ref().map(|d| &d.texture.tex))
             .map_or((0, 0), |t| (t.width(), t.height()));
+        note_op(Op::Render {
+            draws: rp.draws.len(),
+            w: rt_size.0 as u32,
+            h: rt_size.1 as u32,
+            geometry: rp
+                .draws
+                .iter()
+                .map(|d| match d.call {
+                    victory_backend::resources::DrawCall::Arrays {
+                        vertex_count,
+                        instance_count,
+                        ..
+                    } => u64::from(vertex_count) * u64::from(instance_count.max(1)),
+                    victory_backend::resources::DrawCall::Indexed {
+                        index_count,
+                        instance_count,
+                        ..
+                    } => u64::from(index_count) * u64::from(instance_count.max(1)),
+                })
+                .sum(),
+        });
         for d in &rp.draws {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);

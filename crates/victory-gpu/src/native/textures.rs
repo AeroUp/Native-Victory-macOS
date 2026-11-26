@@ -317,6 +317,20 @@ impl<B: PresentBackend> Title<B> {
         {
             UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
             UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::info!(
+                    key = format_args!("{key:#x}"),
+                    at = format_args!("{:#x}", info.memory as usize),
+                    len = info.size,
+                    w = info.width,
+                    h = info.height,
+                    layers = info.depth_or_layers,
+                    format = info.format,
+                    flags = info.flags,
+                    "a title texture's memory is not in a mapped pool"
+                );
+            }
             return false;
         }
         self.pending.remove(&key);

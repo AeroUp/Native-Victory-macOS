@@ -462,6 +462,25 @@ impl<B: PresentBackend> Title<B> {
             return Ok(false);
         }
         let Some(tex) = self.texture_of(key) else {
+            // A frame that cannot be shown is black; say once what the resource is (a swapchain
+            // texture the title never registered, or one whose memory is not in a mapped pool).
+            static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&key) && seen.len() < 8 {
+                seen.push(key);
+                let pending = self.pending.get(&key).map(|i| {
+                    format!(
+                        "{:?} {}x{} format {} flags {} at {:#x}+{:#x}",
+                        i.dimension, i.width, i.height, i.format, i.flags, i.memory as usize, i.size
+                    )
+                });
+                tracing::warn!(
+                    key = format_args!("{key:#x}"),
+                    known = self.textures.contains_key(&key),
+                    ?pending,
+                    "the frame the title presents has no host texture"
+                );
+            }
             return Ok(false);
         };
         let q = self.queue(queue)?;
