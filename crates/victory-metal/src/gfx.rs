@@ -67,6 +67,16 @@ impl Drop for Heap {
 
 pub struct Texture {
     tex: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// What the allocation costs (0 for a view, which allocates nothing), for the footprint log.
+    bytes: u64,
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            crate::stats::texture_destroyed(self.bytes);
+        }
+    }
 }
 
 impl Texture {
@@ -487,6 +497,8 @@ impl ResourceBackend for Metal {
         } else {
             None
         };
+        crate::stats::HEAP_BYTES
+            .fetch_add((count * ENTRY) as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Heap {
             buf,
             kind,
@@ -497,7 +509,6 @@ impl ResourceBackend for Metal {
             dirty: Cell::new(false),
         })
     }
-
     fn heap_address(&self, heap: &Heap, index: usize) -> u64 {
         heap.buf.gpuAddress() + (index * ENTRY) as u64
     }
@@ -565,7 +576,11 @@ impl ResourceBackend for Metal {
             .dev
             .newTextureWithDescriptor(&td)
             .ok_or("newTextureWithDescriptor failed")?;
-        Ok(Texture { tex })
+        crate::stats::texture_created(d);
+        Ok(Texture {
+            tex,
+            bytes: crate::stats::texture_bytes(d),
+        })
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
@@ -604,7 +619,7 @@ impl ResourceBackend for Metal {
                 .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, bytes: 0 })
     }
 
     fn create_texture_over_memory(
@@ -634,7 +649,7 @@ impl ResourceBackend for Metal {
             .buf
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, row_pitch)
             .ok_or("buffer-backed texture refused (offset, pitch or format)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, bytes: 0 })
     }
 
     fn linear_alignment(&self, f: Format) -> usize {
@@ -866,11 +881,18 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        // A command buffer the GPU fails is logged (the first few), not silently dropped.
-        let failed = block2::RcBlock::new(|done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        // A command buffer the GPU fails is logged (the first few), not silently dropped. One that
+        // took long is logged too: a fence wait of seconds is either this or a submission that
+        // never reached the GPU, and the two need different fixes.
+        let queued = std::time::Instant::now();
+        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            let ms = queued.elapsed().as_millis();
+            if ms >= 500 {
+                eprintln!("metal: command buffer took {ms} ms");
+            }
             if let Some(e) = done.error()
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
             {

@@ -19,6 +19,18 @@ use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_formats::texture::{Dimension, Layout};
 
+/// What realized host textures cost, in bytes of title memory they mirror (a close estimate of
+/// their host size) and how many there are. Logged with the frame counters so a leak or an
+/// unbounded world-streaming set shows up before the machine swaps.
+pub static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TEXTURE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TARGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PENDING_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TEXTURE_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Realized textures whose title memory is no longer mapped, and their bytes.
+pub static UNMAPPED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static UNMAPPED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `D3D12_RESOURCE_FLAGS`.
 const RENDER_TARGET: u32 = 1;
 const DEPTH_STENCIL: u32 = 2;
@@ -270,7 +282,9 @@ impl<B: PresentBackend> Title<B> {
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.
     pub fn texture_created(&mut self, key: usize, info: TextureInfo) {
-        self.pending.insert(key, info);
+        if self.pending.insert(key, info).is_none() {
+            PENDING_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Makes the host texture of title texture `key` if it has none yet and registers it for
@@ -282,6 +296,7 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
+        PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let Some(desc) = info.desc() else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
@@ -299,6 +314,21 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
+        // A texture whose memory is no longer in a mapped pool is a descriptor the title left
+        // behind: its host copy would be read from unmapped memory, and its bytes are the largest
+        // consumer we have. `VICTORY_SKIP_UNMAPPED` skips it; without it the case is only counted.
+        if self
+            .host
+            .memory()
+            .resolve(info.memory as u64, info.size as u64)
+            .is_none()
+        {
+            UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var_os("VICTORY_SKIP_UNMAPPED").is_some() {
+                return false;
+            }
+        }
         self.host.register_texture(key, &tex);
         // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
         // it changes, as it is not otherwise seen (a GPU write never changes title memory).
@@ -316,6 +346,12 @@ impl<B: PresentBackend> Title<B> {
         }
         if !info.render_target() {
             self.unloaded.insert(key);
+        }
+        let bytes = info.size as u64;
+        TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        TEXTURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if info.render_target() {
+            TARGET_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
         self.textures.insert(
             key,
@@ -348,8 +384,17 @@ impl<B: PresentBackend> Title<B> {
     }
 
     pub fn texture_released(&mut self, key: usize) {
-        self.textures.remove(&key);
-        self.pending.remove(&key);
+        if let Some(t) = self.textures.remove(&key) {
+            let bytes = t.info.size as u64;
+            TEXTURE_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+            TEXTURE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if t.info.render_target() {
+                TARGET_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if self.pending.remove(&key).is_some() {
+            PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
         watch(|w| {
@@ -419,6 +464,11 @@ impl<B: PresentBackend> Title<B> {
     }
 
     fn sync_keys(&mut self, keys: Vec<usize>) {
+        // A world load realizes thousands of textures at once; detiling and uploading all of them
+        // in one submission holds the frame (and its fence wait) for seconds, which reads as a
+        // stuck GPU. What does not fit waits for the next submission.
+        const SYNC_MS: u128 = 8;
+        const SYNC_BYTES: u64 = 48 << 20;
         let Title {
             host,
             textures,
@@ -426,10 +476,27 @@ impl<B: PresentBackend> Title<B> {
             stats,
             ..
         } = self;
-        for key in keys {
-            let Some(t) = textures.get_mut(&key) else {
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        let mut bytes = 0u64;
+        for (n, key) in keys.iter().enumerate() {
+            if done > 0 && (bytes >= SYNC_BYTES || started.elapsed().as_millis() >= SYNC_MS) {
+                let rest = &keys[n..];
+                watch(|w| w.dirty.extend(rest.iter().copied()));
+                tracing::info!(
+                    done,
+                    rest = rest.len(),
+                    bytes,
+                    ms = started.elapsed().as_millis(),
+                    "texture upload budget spent: the rest waits for the next submission"
+                );
+                return;
+            }
+            let Some(t) = textures.get_mut(key) else {
                 continue;
             };
+            bytes += t.info.size as u64;
+            done += 1;
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
@@ -438,7 +505,7 @@ impl<B: PresentBackend> Title<B> {
             // Written again after its first upload, or blank at it (written later): hot.
             if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
                 if t.hot == 0 {
-                    hot_keys.push(key);
+                    hot_keys.push(*key);
                 }
                 t.hot = HOT;
             }

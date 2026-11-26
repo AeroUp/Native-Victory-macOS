@@ -14,3 +14,5 @@ pub mod metal;
 pub mod msc;
 #[cfg(target_os = "macos")]
 pub mod present;
+#[cfg(target_os = "macos")]
+pub mod stats;

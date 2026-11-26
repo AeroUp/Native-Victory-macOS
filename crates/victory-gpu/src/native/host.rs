@@ -23,6 +23,35 @@ enum Res<B: GraphicsBackend> {
     Texture(Rc<B::Texture>),
 }
 
+/// Texture keys whose descriptor the title wrote since the last frame log, and how many writes
+/// there were: how much of the realized set one frame actually re-references (the LRU input for a
+/// texture budget).
+static TOUCHED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+static TOUCHED_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn touched(key: usize) {
+    TOUCHED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOUCHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default()
+        .insert(key);
+}
+
+/// `(distinct textures touched, writes)` since the last call.
+pub fn touched_take() -> (usize, u64) {
+    let distinct = TOUCHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map_or(0, |s| s.len());
+    (
+        distinct,
+        TOUCHED_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
     memory: Arc<PoolTable>,
@@ -273,6 +302,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 mips,
                 format,
             } => {
+                touched(resource);
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     return Ok(false);
                 };

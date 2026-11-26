@@ -105,14 +105,28 @@ impl PoolTable {
         );
         let g = self.lock();
         let (&at, m) = g.maps.range(..=addr).next_back()?;
-        if addr + len > at + m.len {
+        if addr >= at + m.len {
             return None;
         }
         let pool = g.pools.get(&m.pool)?;
-        Some((
-            pool.clone(),
-            (pool.base + m.offset + (addr - at)) as *const u8,
-        ))
+        let base = pool.base + m.offset + (addr - at);
+        let Some(end) = addr.checked_add(len) else {
+            return None;
+        };
+        // A buffer can cross a mapping boundary when the title maps one pool in several adjacent
+        // pieces: accept it while the pieces are adjacent in the title's address space and in the
+        // pool, so one host buffer still names the bytes.
+        let mut covered = at + m.len;
+        let mut next_offset = m.offset + m.len;
+        while covered < end {
+            let (&next_at, next) = g.maps.range(covered..).next()?;
+            if next_at != covered || next.pool != m.pool || next.offset != next_offset {
+                return None;
+            }
+            covered = next_at + next.len;
+            next_offset = next.offset + next.len;
+        }
+        Some((pool.clone(), base as *const u8))
     }
 
     /// A number that changes whenever a pool or a mapping does: what a table built from

@@ -378,8 +378,11 @@ fn log_pending(this: Array, index: u32, polls: u64) {
             let running: Vec<String> = l
                 .running_what
                 .iter()
-                .map(|(seq, (options, dst, src, offset, name))| {
-                    format!("running seq {seq} options {options:#x} dst {dst} src {src} offset {offset} file {name}")
+                .map(|(seq, (options, dst, src, offset, name, since))| {
+                    format!(
+                        "running seq {seq} options {options:#x} dst {dst} src {src} offset {offset} file {name} for {} ms",
+                        since.elapsed().as_millis()
+                    )
                 })
                 .collect();
             let front = l.reads.front().map_or_else(String::new, |(seq, r)| {
@@ -496,7 +499,7 @@ struct Lane {
     running: BTreeSet<u64>,
     /// What each running read is (options, sizes, offset), for the log of a
     /// status entry that never completes.
-    running_what: BTreeMap<u64, (u64, u32, u32, u64, String)>,
+    running_what: BTreeMap<u64, (u64, u32, u32, u64, String, std::time::Instant)>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
 }
@@ -562,6 +565,27 @@ fn scheduler() -> Option<&'static Scheduler> {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     let g = scheduler.lock();
+                    // A read running for long is the one to look at: a status
+                    // entry behind it is what the load waits on.
+                    if let Some((id, seq, what)) = g
+                        .lanes
+                        .iter()
+                        .flat_map(|(id, l)| l.running_what.iter().map(move |(seq, w)| (*id, *seq, w)))
+                        .max_by_key(|(_, _, w)| w.5.elapsed())
+                        .filter(|(_, _, w)| w.5.elapsed().as_secs() >= 1)
+                    {
+                        tracing::warn!(
+                            lane = id,
+                            seq,
+                            options = format_args!("{:#x}", what.0),
+                            dst = what.1,
+                            src = what.2,
+                            offset = what.3,
+                            file = %what.4,
+                            ms = what.5.elapsed().as_millis(),
+                            "dstorage: the oldest running read"
+                        );
+                    }
                     let lanes: Vec<String> = g
                         .lanes
                         .iter()
@@ -679,6 +703,7 @@ impl Lanes {
                     request.source_size,
                     request.offset,
                     source_name(&request).to_owned(),
+                    std::time::Instant::now(),
                 ),
             );
         self.staged += staging;

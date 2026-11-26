@@ -181,6 +181,9 @@ impl ComputeBackend for Metal {
                 )
         }
         .ok_or("newBufferWithBytesNoCopy refused the range (alignment or size)")?;
+        crate::stats::WRAPPED_BYTES
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::WRAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Buffer {
             buf,
             base: ptr,

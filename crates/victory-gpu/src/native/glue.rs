@@ -632,6 +632,10 @@ pub(crate) fn warn_once(what: &'static str) {
 /// Draws the title recorded, and those that went on to the host list.
 static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Geometry the title asked for, summed: vertices, indices and instances. A frame whose sum is far
+/// past what the scene holds is a bounds bug, and the GPU time it takes shows up as a stuck fence.
+static GEOMETRY: [std::sync::atomic::AtomicU64; 3] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 /// Presents whose resource had no host texture.
 static NO_TEXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -654,6 +658,39 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
     tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+    // Geometry since the previous line: a runaway sum here is what a multi-second frame looks
+    // like on the GPU side.
+    let geometry: Vec<u64> = GEOMETRY.iter().map(|g| g.swap(0, Ordering::Relaxed)).collect();
+    tracing::info!(frame, vertices = geometry[0], indices = geometry[1], instances = geometry[2], "geometry since the last line");
+    // What the realized title textures cost: the host copies their memory, so this is the
+    // largest single consumer after the title's own.
+    use std::sync::atomic::Ordering::Relaxed;
+    tracing::info!(
+        frame,
+        textures = crate::native::textures::TEXTURE_COUNT.load(Relaxed),
+        texture_gb = crate::native::textures::TEXTURE_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64,
+        targets_gb = crate::native::textures::TARGET_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64,
+        pending = crate::native::textures::PENDING_COUNT.load(Relaxed),
+        evicted = crate::native::textures::TEXTURE_EVICTED.load(Relaxed),
+        unmapped = crate::native::textures::UNMAPPED_COUNT.load(Relaxed),
+        unmapped_gb =
+            crate::native::textures::UNMAPPED_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64,
+        "texture footprint"
+    );
+    let (touched, writes) = crate::native::host::touched_take();
+    tracing::info!(frame, touched, writes, "textures the title re-referenced");
+    // Split the backend's allocations by kind. "wrapped" is title memory mapped without a copy,
+    // so it is not extra memory; the rest is the host's own.
+    let (n, bytes, heaps, uploads, wrapped) = victory_metal::stats::snapshot();
+    tracing::info!(
+        frame,
+        metal_textures = n,
+        metal_texture_gb = bytes as f64 / (1u64 << 30) as f64,
+        heaps_mb = heaps as f64 / (1u64 << 20) as f64,
+        uploads_mb = uploads as f64 / (1u64 << 20) as f64,
+        wrapped_gb = wrapped as f64 / (1u64 << 30) as f64,
+        "metal footprint"
+    );
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
@@ -913,6 +950,8 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    GEOMETRY[0].fetch_add(u64::from(vertices) * u64::from(instances.max(1)), Ordering::Relaxed);
+    GEOMETRY[2].fetch_add(u64::from(instances), Ordering::Relaxed);
     if tracing_targets() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -964,6 +1003,8 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    GEOMETRY[1].fetch_add(u64::from(indices) * u64::from(instances.max(1)), Ordering::Relaxed);
+    GEOMETRY[2].fetch_add(u64::from(instances), Ordering::Relaxed);
     with_list(this, |t, l| {
         if let Some(rect) = graphics(t, l) {
             if rect {
