@@ -1108,6 +1108,19 @@ impl Metal {
                         y: o[1] as usize,
                         z: o[2] as usize,
                     };
+                    // Metal asserts on a copy between unlike pixel formats (the console allows a
+                    // family of them); the copy is skipped and named once.
+                    if src.tex.pixelFormat() != dst.tex.pixelFormat() {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            eprintln!(
+                                "metal: a texture copy between unlike formats ({} -> {}) is skipped",
+                                src.tex.pixelFormat().0,
+                                dst.tex.pixelFormat().0
+                            );
+                        });
+                        continue;
+                    }
                     // SAFETY: the regions lie inside both textures (the caller decoded the title's
                     // box against them); `MTLOrigin` and `MTLSize` are plain values.
                     unsafe {
