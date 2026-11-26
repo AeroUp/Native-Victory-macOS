@@ -57,6 +57,9 @@ log="$run_dir/victory.log"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
+# Metal's own HUD in the window's top right: frame rate, frame interval, GPU
+# time, and what the frame is doing. MTL_HUD_ENABLED=0 turns it off.
+export MTL_HUD_ENABLED="${MTL_HUD_ENABLED:-1}"
 # Press Enter (the pad's A) every 2 s from 4 s to 80 s unless VICTORY_KEYS is set.
 export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"
 echo "Running $exe (console=$console)"
