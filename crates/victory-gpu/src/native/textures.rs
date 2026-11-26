@@ -305,33 +305,37 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.get(&key).cloned() else {
             return false;
         };
-        // A texture whose memory is no longer in a mapped pool is a descriptor the title left
-        // behind (or one written before the pool was mapped): the host could only read zeros, and
-        // a full-size host texture of zeros is the largest waste the host has. It stays pending,
-        // so a later view of it tries again once its memory is mapped.
+        // A texture whose memory is in neither a pool nor this process's own address space is a
+        // descriptor the title left behind: reading it yields zeros and a full-size host texture of
+        // zeros is the largest waste the host has. It stays pending, so a later view tries again.
+        // Some resources (the swapchain's 4K images) are allocated by the runtime in host memory
+        // and have no title address at all: those read fine here and are kept.
         if self
             .host
             .memory()
             .resolve(info.memory as u64, info.size as u64)
             .is_none()
         {
-            UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
-            UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                tracing::info!(
-                    key = format_args!("{key:#x}"),
-                    at = format_args!("{:#x}", info.memory as usize),
-                    len = info.size,
-                    w = info.width,
-                    h = info.height,
-                    layers = info.depth_or_layers,
-                    format = info.format,
-                    flags = info.flags,
-                    "a title texture's memory is not in a mapped pool"
-                );
+            let mut probe = [0u8; 16];
+            if !super::safe_read(info.memory, &mut probe) {
+                UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+                UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    tracing::info!(
+                        key = format_args!("{key:#x}"),
+                        at = format_args!("{:#x}", info.memory as usize),
+                        len = info.size,
+                        w = info.width,
+                        h = info.height,
+                        layers = info.depth_or_layers,
+                        format = info.format,
+                        flags = info.flags,
+                        "a title texture's memory is not in a mapped pool"
+                    );
+                }
+                return false;
             }
-            return false;
         }
         self.pending.remove(&key);
         PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
