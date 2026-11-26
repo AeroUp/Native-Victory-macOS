@@ -718,6 +718,8 @@ pub(crate) fn log_draw_counts(frame: u64) {
         lazy = crate::native::textures::LAZY_COUNT.load(Relaxed),
         "texture footprint"
     );
+    let (converted, cached) = victory_metal::msc::cache_counts();
+    tracing::info!(frame, converted, cached, "shader converter cache");
     let (touched, writes) = crate::native::host::touched_take();
     tracing::info!(frame, touched, writes, "textures the title re-referenced");
     // Split the backend's allocations by kind. "wrapped" is title memory mapped without a copy,

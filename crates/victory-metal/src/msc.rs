@@ -143,6 +143,30 @@ impl Msc {
         entry: Option<&str>,
         layout: Option<&RootLayout>,
     ) -> Result<(i32, Vec<u8>), ConvError> {
+        // The conversion is the slowest thing a new shader costs (LLVM under Rosetta), and the
+        // title's shaders are the same bytes on every run: keep the metallib on disk by input.
+        let cache = std::env::var_os("VICTORY_MSC_CACHE_OFF").is_none();
+        let key = cache.then(|| cache_key(dxil, entry, layout));
+        if let Some(key) = key
+            && let Some(hit) = load_cached(key)
+        {
+            HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(hit);
+        }
+        let out = self.convert_uncached(dxil, entry, layout);
+        if let (Some(key), Ok((stage, lib))) = (key, &out) {
+            store_cached(key, *stage, lib);
+            MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn convert_uncached(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+    ) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
@@ -248,4 +272,55 @@ impl Msc {
             res
         }
     }
+}
+
+
+/// Converted shaders served from the disk cache, and those that had to be converted.
+static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cache_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::PathBuf::from(home).join("Library/Caches/victory-mac/msc-shaders");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The cache key: a hash of everything the converter's output depends on.
+fn cache_key(dxil: &[u8], entry: Option<&str>, layout: Option<&RootLayout>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "victory-msc-cache-v1".hash(&mut h);
+    dxil.hash(&mut h);
+    entry.hash(&mut h);
+    layout.hash(&mut h);
+    h.finish()
+}
+
+fn load_cached(key: u64) -> Option<(i32, Vec<u8>)> {
+    let path = cache_dir()?.join(format!("{key:016x}.bin"));
+    let bytes = std::fs::read(path).ok()?;
+    let stage = i32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    Some((stage, bytes.get(4..)?.to_vec()))
+}
+
+fn store_cached(key: u64, stage: i32, lib: &[u8]) {
+    let Some(dir) = cache_dir() else { return };
+    let path = dir.join(format!("{key:016x}.bin"));
+    let mut bytes = Vec::with_capacity(4 + lib.len());
+    bytes.extend_from_slice(&stage.to_le_bytes());
+    bytes.extend_from_slice(lib);
+    // Write then rename, so an interrupted run cannot leave a half shader behind.
+    let tmp = dir.join(format!("{key:016x}.tmp"));
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// `(converted, served-from-disk)`, for a log line or a test.
+pub fn cache_counts() -> (u64, u64) {
+    (
+        MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
