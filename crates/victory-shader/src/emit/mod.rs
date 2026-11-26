@@ -237,6 +237,8 @@ mod mask_tests;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
+#[cfg(test)]
+mod sample_tests;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
@@ -475,7 +477,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let guessed = graphics::is_guessed(&c);
-    let computed_buffers = guessed && options.zero_copy_memory;
+    let computed_buffers =
+        (guessed || native.stage == HwStage::Cs) && options.zero_copy_memory;
     let res = resource::track_graphics(
         &p, &native.layout, native.stage, st.as_ref().ok(), computed_buffers,
     )?;

@@ -15,13 +15,30 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
 pub struct Metal {
     pub(crate) dev: Dev,
-    pub(crate) msc: Msc,
+    /// Opened at creation when installed; shader compilation reports the error if absent.
+    pub(crate) msc: Result<Msc, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
     /// The set of the title's pool buffers, made when the first one is.
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+    /// Compiled pipelines kept across runs, opened at the first pipeline (when the cache folder is set).
+    pub(crate) archive: std::cell::OnceCell<Option<crate::archive::Archive>>,
+    /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
+    pub(crate) trace_fails: bool,
+    /// Pipeline state pointer to name, kept only when tracing.
+    pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
+    pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
+    pub(crate) gate:
+        std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+}
+
+/// Seconds since the first `Metal::new` (about process start), for the failure trace.
+pub(crate) fn since_start() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 /// Counters of residency work.
@@ -62,11 +79,16 @@ pub struct Queue(
     /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
     /// tracking cannot see those accesses: command buffers wait for the one before through this
     /// event (and encoders within one through a fence), counted by `.3`.
-    pub(crate) Retained<ProtocolObject<dyn MTLEvent>>,
+    /// A shared event, so that a command buffer the GPU fails can still be paid on the CPU.
+    pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
 );
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
-pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
+pub struct Pipeline(
+    pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The shader's static samplers, which its argument buffer points at.
+    pub(crate) Option<crate::gfx::StaticSamplers>,
+);
 
 /// A wrapped range of title memory.
 pub struct Buffer {
@@ -93,6 +115,8 @@ impl Buffer {
 
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
+    /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
+    /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
         // Residency is per encoder (`useResource`) unless `VICTORY_METAL_RESIDENCY_SETS=1`. A
@@ -105,16 +129,29 @@ impl Metal {
             && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
         Ok(Metal {
             dev,
-            msc: Msc::open_default(),
+            msc: Msc::try_open_default(),
             residency_sets,
             pool_set: Default::default(),
             counts: Default::default(),
+            archive: Default::default(),
+            trace_fails: {
+                since_start();
+                std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
+            },
+            pipe_names: Default::default(),
+            trace_enc: Default::default(),
+            gate: Default::default(),
         })
+    }
+
+    pub(crate) fn msc(&self) -> Result<&Msc, String> {
+        self.msc.as_ref().map_err(Clone::clone)
     }
 
     fn compute_from(
         &self,
         converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
+        layout: Option<&RootLayout>,
     ) -> Result<Pipeline, String> {
         let (_, lib) = converted.map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
@@ -124,11 +161,19 @@ impl Metal {
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
-        let p = self
-            .dev
-            .newComputePipelineStateWithFunction_error(&f)
-            .map_err(|e| e.localizedDescription().to_string())?;
-        Ok(Pipeline(p))
+        let p = match self.archive() {
+            Some(a) => a.compute(&self.dev, &f)?,
+            None => self
+                .dev
+                .newComputePipelineStateWithFunction_error(&f)
+                .map_err(|e| e.localizedDescription().to_string())?,
+        };
+        Ok(Pipeline(p, self.static_samplers(layout)?))
+    }
+
+    /// The pipeline archive, if the cache is on.
+    pub(crate) fn archive(&self) -> Option<&crate::archive::Archive> {
+        self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
     /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
@@ -164,7 +209,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newEvent().ok_or("newEvent failed")?;
+        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
         Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
     }
 
@@ -236,8 +281,15 @@ impl ComputeBackend for Metal {
         b.buf.gpuAddress() + (title as usize - b.base as usize) as u64
     }
 
+    fn name_pipeline(&self, p: &Pipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.0) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert(dxil, None))
+        self.compute_from(self.msc()?.convert(dxil, None), None)
     }
 
     fn create_compute_pipeline_with(
@@ -245,7 +297,10 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert_with(dxil, None, Some(layout)))
+        self.compute_from(
+            self.msc()?.convert_with(dxil, None, Some(layout)),
+            Some(layout),
+        )
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
@@ -344,6 +399,8 @@ mod tests {
             heaps: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
+            count: None,
         }
     }
 
@@ -461,5 +518,19 @@ mod tests {
         );
         // SUBS is even: the last write is array 0.
         assert!((0..N).all(|i| mem.get(0, i) == SUBS as u32));
+    }
+
+    #[test]
+    fn missing_msc_returns_error_instead_of_panicking() {
+        let mut m = Metal::new().expect("Metal device available on macOS");
+        m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib");
+        // Non-shader operations still succeed without MSC.
+        let q = m.create_queue().unwrap();
+        let f = m.create_fence(0).unwrap();
+        m.signal(&f, 1);
+        assert_eq!(m.completed(&f), 1);
+        drop(q);
+        // Shader conversion returns an Err instead of panicking.
+        assert!(m.create_compute_pipeline(AFFINE).is_err());
     }
 }

@@ -18,6 +18,37 @@ fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// `v_pk_fmac_f16` (VOP2) with a constant first source translates: an inline float constant is
+/// its f16 in the low half and 0 in the high one, an integer one its 32-bit value, a literal its
+/// two halves (llvm-mc's encodings for gfx1030). Values: `valu_tests`.
+#[test]
+fn packed_fmac_takes_constant_operands() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |fmac: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        code.extend_from_slice(fmac);
+        code.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    for fmac in [
+        &[0x7800_00F2][..],          // v_pk_fmac_f16 v0, 1.0, v0
+        &[0x7800_00C1],              // v_pk_fmac_f16 v0, -1, v0
+        &[0x7800_00FF, 0x4000_3C00], // v_pk_fmac_f16 v0, 0x40003c00, v0
+    ] {
+        translate_with(&program(fmac), Options::default()).unwrap();
+    }
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
@@ -732,6 +763,48 @@ fn refusal1_console_layout_dependent_masks_remain_refused() {
 // Refusal #2: "a pixel system input the signature lacks"
 // =========================================================================
 
+/// A buffer descriptor's dword that is no size, read as data, is refused naming it: the host
+/// has no value for the base address, the high address bits and stride, or the format.
+#[test]
+fn descriptor_dwords_read_as_data_say_which() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+            read,        // v_mov_b32 v2, s<12 + n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // A raw UAV at table dword 0, the buffer read at dword 8.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a descriptor's address or format read as data: ";
+    for (read, why) in [
+        (0x7E04_020C, "a buffer's base address (dword 0)"),
+        (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+        (0x7E04_020F, "a buffer's dword 3 (format and type)"),
+    ] {
+        let err = translate_with(&program(read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage
@@ -1142,7 +1215,10 @@ fn refusal4_non_generic_and_non_provoking_interp_remain_refused() {
 }
 
 // =========================================================================
-// Refusal #5: "an address in an SGPR that is no root parameter"
+// Former refusal #5: "an address in an SGPR that is no root parameter".
+// Such an address now tracks as title memory and plain loads through it
+// lower; what still refuses is reading the SGPR itself when nothing declares
+// it ("a hardware SGPR input") or building a descriptor around it.
 // =========================================================================
 
 #[test]
@@ -1170,7 +1246,8 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
         graphics::container(HwStage::Vs, &bytes_of(&guessed_heap_vs), &[0u8; 0x10]).unwrap();
     translate_with(&container, Options::default()).unwrap();
 
-    // Non-guessed VS (`layout = []`) reading from undeclared s[2:3] MUST still refuse!
+    // Non-guessed VS (`layout = []`) reading from undeclared s[2:3] MUST still refuse:
+    // the address tracks as title memory, but lowering then reads s[2:3] itself.
     let undeclared_load = [
         0xF400_0101,
         0xFA00_0000, // s_load_dword s4, s[2:3], 0x0
@@ -1184,8 +1261,7 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
         .err()
         .expect("expected refusal");
     assert!(
-        err.to_string()
-            .contains("an address in an SGPR that is no root parameter"),
+        err.to_string().contains("a hardware SGPR input"),
         "got `{err}`"
     );
 }
@@ -1249,8 +1325,22 @@ fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
         0xBF81_0000,
     ];
     meta[0x25] = 0;
-    let err = lower(&unbound, &meta).err().unwrap();
-    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+    // An address in the undeclared s[6:7] pair is title memory: inference
+    // declares the pair as root constants and the load lowers through the
+    // memory space.
+    let unbound_shader = lower(&unbound, &meta).unwrap();
+    assert!(
+        unbound_shader
+            .user_data
+            .iter()
+            .any(|u| u.index == 6 && u.root == RootType::Constants)
+            && unbound_shader
+                .user_data
+                .iter()
+                .any(|u| u.index == 7 && u.root == RootType::Constants),
+        "{:?}",
+        unbound_shader.user_data
+    );
 }
 
 #[test]
@@ -1281,7 +1371,11 @@ fn guessed_vertex_rebases_a_header_relative_root_view() {
     assert_eq!(lower(&meta).unwrap().root_cbvs, [3]);
     meta[13] = 6;
     let err = lower(&meta).err().unwrap();
-    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("a buffer descriptor built around a computed address"),
+        "{err}"
+    );
 }
 
 // =========================================================================
@@ -1443,11 +1537,22 @@ fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
 
 /// [`typed_store_cs`] with the words `setup` run just before the store.
 fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    store_cs(4, setup, store)
+}
+
+/// [`typed_store_cs_after`] with a descriptor of `dwords` (4, or 8 for an
+/// image) in s[8:].
+fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
     let mut words = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0202,
-        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        // s_load_dwordx4 s[8:11] (x8 s[8:15]), s[4:5], 0x0
+        if dwords == 8 {
+            0xF40C_0202
+        } else {
+            0xF408_0202
+        },
+        0xFA00_0000,
         0x7E02_0300, // v_mov_b32 v1, v0
         0x7E04_0300, // v_mov_b32 v2, v0
         0x7E06_0300, // v_mov_b32 v3, v0
@@ -1474,7 +1579,7 @@ fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
-            dwords: 4,
+            dwords,
             user_data: 0,
             slot: 0,
         }],
@@ -1632,6 +1737,80 @@ fn normalized_16_bit_packing_lowers_in_pixel_shader() {
     );
 }
 
+// =========================================================================
+// "s_pack_ll_b32_b16 / s_bfm_b64 / s_bitreplicate_b64_b32 / v_mad_u32_u16
+// is not supported"
+// =========================================================================
+
+#[test]
+fn scalar_packs_masks_and_16_bit_mads_lower_in_pixel_shader() {
+    // s_mov_b32 s0, 0x12345678
+    // s_mov_b32 s1, 0x9abcdef0
+    // <op>: a scalar result in s2 (s[2:3]), or the mad's in v0
+    // v_mov_b32_e32 v0, s2         (scalar ops)
+    // v_mov_b32_e32 v1, s2 (s3)    (scalar ops)
+    // exp mrt0 v0, v1, v0, v1 done vm
+    // s_endpgm
+    let code = |op: &[u32], wide: bool| {
+        let mut w = vec![0xBE80_03FF, 0x1234_5678, 0xBE81_03FF, 0x9ABC_DEF0];
+        w.extend_from_slice(op);
+        if op.len() == 1 {
+            w.extend([0x7E00_0202, if wide { 0x7E02_0203 } else { 0x7E02_0202 }]);
+        }
+        w.extend([0xF800_180F, 0x0100_0100, 0xBF81_0000]);
+        w
+    };
+    // v_mov_b32_e32 v1, s0; v_mov_b32_e32 v2, s1; then the mad.
+    let mad = |word0: u32, word1: u32| [0x7E02_0200, 0x7E04_0201, word0, word1];
+    for (what, op) in [
+        ("s_pack_ll_b32_b16 s2, s0, s1", code(&[0x9902_0100], false)),
+        ("s_pack_lh_b32_b16 s2, s0, s1", code(&[0x9982_0100], false)),
+        ("s_pack_hh_b32_b16 s2, s0, s1", code(&[0x9A02_0100], false)),
+        ("s_bfm_b64 s[2:3], s0, s1", code(&[0x9282_0100], true)),
+        ("s_bfm_b64 s[2:3], 40, 3", code(&[0x9282_83A8], true)),
+        (
+            "s_bitreplicate_b64_b32 s[2:3], s0",
+            code(&[0xBE82_3B00], true),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1",
+            code(&mad(0xD773_0000, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[1,0,0,0]",
+            code(&mad(0xD773_0800, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[0,1,0,0]",
+            code(&mad(0xD773_1000, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[1,1,0,0]",
+            code(&mad(0xD773_1800, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, s0, 7, v1",
+            code(&mad(0xD773_0000, 0x0405_0E00), false),
+        ),
+    ] {
+        for wave32_host in [false, true] {
+            lower_ps(&op, true, vec![], vec![], 0, 0, vec![], wave32_host)
+                .unwrap_or_else(|e| panic!("{what}, wave32_host={wave32_host}: {e}"));
+        }
+    }
+    // v_mad_u32_u16 v0, v1, v2, v1 op_sel:[0,0,1,0]: op_sel on the 32-bit
+    // addend has no meaning in the manual and stays refused.
+    let opsel2 = code(&mad(0xD773_2000, 0x0406_0501), false);
+    let err = lower_ps(&opsel2, true, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string()
+            .contains("op_sel or modifiers on a 32-bit operand"),
+        "got `{err}`"
+    );
+}
+
 /// What "a computed buffer descriptor used as a view" names: only an image
 /// instruction asks for a view of four computed dwords, as its sampler (told
 /// apart here) or as a 128-bit image descriptor (`r128`, instruction bit 15).
@@ -1694,31 +1873,212 @@ fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
 }
 
 // =========================================================================
-// An image store of some channels
+// Compute: "an image store of some channels"
 // =========================================================================
 
-/// A minimal compute program whose descriptor tables start at `s0`.
-fn lower_cs(words: &[u32], used: Vec<UsedResource>) -> Result<Lowered, ShaderError> {
+/// Image stores of some channels write the whole texel (0 in the channels
+/// dmask leaves out: `valu_tests` runs some), the data holding the dmask's
+/// channels in turn, so they lower as the four-channel store does.
+#[test]
+fn image_stores_of_some_channels_lower() {
+    // v_mov_b32 v5, v0; v_mov_b32 v6, 0: the texel (lane, 0).
+    let at = [0x7E0A_0300, 0x7E0C_0280];
+    let stores: &[(u32, u32, &str)] = &[
+        (
+            0xF020_1108,
+            0x0002_0105,
+            "image_store v1, v[5:6], s[8:15] dmask:0x1 dim:2D unorm",
+        ),
+        (
+            0xF020_1308,
+            0x0002_0105,
+            "image_store v[1:2], v[5:6], s[8:15] dmask:0x3 dim:2D unorm",
+        ),
+        (
+            0xF020_1508,
+            0x0002_0105,
+            "image_store v[1:2], v[5:6], s[8:15] dmask:0x5 dim:2D unorm",
+        ),
+        (
+            0xF020_1E08,
+            0x0002_0105,
+            "image_store v[1:3], v[5:6], s[8:15] dmask:0xe dim:2D unorm",
+        ),
+        (
+            0xF020_1F08,
+            0x0002_0105,
+            "image_store v[1:4], v[5:6], s[8:15] dmask:0xf dim:2D unorm",
+        ),
+        (
+            0xF020_1508,
+            0x8002_0105,
+            "image_store v1, v[5:6], s[8:15] dmask:0x5 dim:2D unorm d16",
+        ),
+    ];
+    for &(w0, w1, asm) in stores {
+        let l = store_cs(8, &at, [w0, w1]).unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+    // dmask 0: what the hardware stores is not documented.
+    let err = store_cs(8, &at, [0xF020_1008, 0x0002_0105])
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string().contains("an image store of no channel"),
+        "got `{err}`"
+    );
+}
+
+// =========================================================================
+// Compute: "a buffer descriptor built around a computed address"
+// =========================================================================
+
+/// A wave32 compute program: s0 is a root constant holding a title address,
+/// s2 a table with a raw UAV. Each lane builds a descriptor over `s0 + 16`
+/// in s[4:7], loads dword `lane` from it by byte offset and stores it to
+/// dword `lane` of the UAV. `computed` is what the translation of a
+/// computed descriptor asks for (title memory, as the native host does).
+fn computed_descriptor_cs(computed: bool) -> Result<Lowered, ShaderError> {
+    let words = [
+        0x8004_9000u32, // s_add_u32 s4, s0, 16
+        0x8205_8080,    // s_addc_u32 s5, 0, 0
+        0x8705_FF05,
+        0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x00014fac
+        0xBE8C_0302, // s_mov_b32 s12, s2
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF408_0406,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8001_0201, // buffer_load_dword v2, v1, s[4:7], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let param = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 16,
-        layout: vec![RootParam {
+        vgprs: 8,
+        layout: vec![param(RootType::Constants, 2, 0, 0), param(RootType::Table, 1, 2, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
         }],
-        used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
-            threads: [32, 1, 1],
-        }),
-        code: bytes_of(words),
+        io: StageIo::Cs(ComputeIo { rsrc2: 3 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
     };
-    let p = ir::build(&native.code, false, native.vgprs)?;
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track_graphics(&p, &native.layout, native.stage, Some(&st), computed)?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: computed,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    })
+}
+
+/// A compute buffer load through a descriptor built around a computed
+/// address reads title memory, as the guessed pixel path does.
+#[test]
+fn compute_computed_buffer_loads_use_title_memory() {
+    let err = computed_descriptor_cs(false).err().expect("refused without title memory");
+    assert!(
+        err.to_string().contains("a buffer descriptor built around a computed address"),
+        "got `{err}`"
+    );
+    let l = computed_descriptor_cs(true).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!l.dxil.is_empty());
+}
+
+// =========================================================================
+// Compute: "a structured buffer of unknown stride"
+// =========================================================================
+
+/// A wave32 compute program: s0 a table with an SRV, s1 a table with a raw
+/// UAV. Each lane reads dword 1 of element `lane` of the SRV by index and
+/// stores it to dword `lane` of the UAV. `stride` is what the metadata says
+/// of the SRV (FSPX records say 0).
+fn indexed_srv_cs(stride: u32) -> Result<Lowered, ShaderError> {
+    let words = [
+        0xBE84_0300u32, // s_mov_b32 s4, s0
+        0xBE85_0380,    // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004,
+        0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let table = |user_data, slot| RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, user_data, slot, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![table(0, 0), table(1, 1)],
+        used: vec![used(ResourceType::Srv, 0, 0, stride), used(ResourceType::Uav, 1, 1, 0)],
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
@@ -1743,50 +2103,99 @@ fn lower_cs(words: &[u32], used: Vec<UsedResource>) -> Result<Lowered, ShaderErr
     })
 }
 
+/// A table SRV the metadata gives no stride is read by element at the
+/// stride of its view in the host's view-stride table, as a heap-indexed
+/// one is; one with a stride keeps it.
 #[test]
-fn image_store_of_some_channels_writes_only_them() {
-    // The image at heap index 0 in the table at s0; v0/v1 the texel, v2/v3
-    // the two channels dmask 0x5 (red and blue) enables.
-    let code = [
-        0xBE84_0300, // s_mov_b32 s4, s0
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xF40C_0202,
-        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
-        0x7E00_0280, // v_mov_b32 v0, 0
-        0x7E02_0280, // v_mov_b32 v1, 0
-        0x7E04_0280, // v_mov_b32 v2, 0
-        0x7E06_0280, // v_mov_b32 v3, 0
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xF020_1508,
-        0x0002_0200, // image_store v[2:3], v[0:1], s[8:15] dmask:0x5 dim:2D
-        0xBF81_0000, // s_endpgm
-    ];
-    let l = lower_cs(&code, vec![uav()]).expect("an image store of some channels");
-    assert_eq!(l.image_store_masks, [0x5], "only red and blue are written");
-
-    // d16 packs the two enabled channels into one register: red low, blue
-    // high (data registers count enabled channels, not channel indices).
-    let mut d16 = code;
-    d16[10] = 0x8002_0200; // image_store_d16 v2, v[0:1], s[8:15] dmask:0x5
-    let l = lower_cs(&d16, vec![uav()]).expect("a d16 store of red and blue");
-    assert_eq!(l.image_store_masks, [0x5]);
-
-    // dmask 0 enables no channel: nothing is written.
-    let mut none = code;
-    none[9] = 0xF020_1008; // dmask:0
-    let l = lower_cs(&none, vec![uav()]).expect("an image store of no channels");
-    assert!(l.image_store_masks.is_empty());
+fn indexed_table_buffers_without_a_stride_use_the_view_stride_table() {
+    for stride in [0, 16] {
+        let l = indexed_srv_cs(stride).unwrap_or_else(|e| panic!("stride {stride}: {e}"));
+        assert!(!l.dxil.is_empty());
+    }
 }
 
-fn uav() -> UsedResource {
-    UsedResource {
-        kind: ResourceType::Uav,
-        root: RootType::Table,
-        table_offset_dwords: 0,
-        lower_bound: 0,
-        stride: 0,
-        dwords: 8,
-        user_data: 0,
-        slot: 0,
+/// A compute program adds dword 2 of 4-dword root constants (s6) to a 1-dword constant (s2) and
+/// stores the sum through the table two slots on (s8): each read names its parameter and dword.
+/// Without the root signature the 4-dword block is guessed one dword (no slot 2), so s6 is
+/// refused.
+#[test]
+fn compute_root_constants_reach_the_user_data() {
+    use crate::native::tests::{fspx_resource, fspx_with, rts0};
+    let code = bytes_of(&[
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xF408_0304,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[8:9], 0x0
+        0x7E00_0206, // v_mov_b32 v0, s6
+        0x4A00_0002, // v_add_nc_u32 v0, s2, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x8003_0001, // buffer_store_dword v0, v1, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let records = [
+        fspx_resource(2, 0, 0, 0, 2, 0),
+        fspx_resource(2, 0, 0, 1, 4, 1),
+        fspx_resource(3, 3, 0, 0, 8, 3),
+    ];
+    let container = |root: Option<&[u8]>| {
+        let part = fspx_with(&code, 9 << 1, [64, 1, 1], true, &records, root);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let root = rts0(&[(1, 1), (1, 4), (0, 0), (0, 0)]);
+    let shader = translate_with(&container(Some(&root)), Options::default()).unwrap();
+    let reads: Vec<_> = shader
+        .user_data
+        .iter()
+        .map(|u| (u.index, u.slot, u.root, u.dword))
+        .collect();
+    for read in [
+        (2, 0, RootType::Constants, 0),
+        (6, 1, RootType::Constants, 2),
+        (8, 3, RootType::Table, 0),
+    ] {
+        assert!(reads.contains(&read), "{reads:?}");
+    }
+    let err = translate_with(&container(None), Options::default()).unwrap_err();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
+
+/// A value a whole-wave section leaves without a shape is refused naming the
+/// first step the simulation does not model, or, when it models every step,
+/// saying the value is no reduction or prefix.
+#[test]
+fn whole_wave_sections_name_the_step_they_do_not_follow() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |step: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        ];
+        code.extend_from_slice(step);
+        code.extend([
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a whole-wave section step the simulation does not follow: ";
+    for (step, why) in [
+        (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+        // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
+        (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+    ] {
+        let err = translate_with(&program(step), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
     }
 }

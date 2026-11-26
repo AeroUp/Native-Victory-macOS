@@ -131,6 +131,9 @@ const PACKET_WAVE32: u16 = 1 << 4;
 const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
+/// An FSPX entry of ours (no console kind): the root signature blob the title created the
+/// pipeline with (device method 0x218), which sizes the program's root constants.
+pub const FSPX_ROOT_SIGNATURE: u32 = u32::from_le_bytes(*b"RTS0");
 const FSPX_RECORD: usize = 32;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
@@ -466,15 +469,18 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
 ///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
 ///   0x41  a resource the code reads: u8 resource type (as FSSM's used
-///         entries), u8 root type (0 root constants, 1 a root descriptor,
-///         3 a descriptor table, 4 an immediate sampler), u16 0, u32 table
-///         offset (dwords), u32 register, u32 view dimension (1 buffer, 4 2D,
-///         0 root view), u8 descriptor dwords (a root constant record's range
-///         length), u8 user-data dword, u8 root slot, u8 0, u32 -1, u32 0
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
 ///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
 ///         u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
+///
+/// The host adds an entry of its own, [`FSPX_ROOT_SIGNATURE`], which sizes root constants (their
+/// records do not say how many dwords they are); without it their size is guessed
+/// ([`expand_constants`]).
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -483,20 +489,23 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if count > MAX_XDAT_ENTRIES {
         return Err(Malformed("implausible FSPX entry count"));
     }
-    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+    let find = |kind: u32| -> Result<Option<&[u8]>, ShaderError> {
         for i in 0..count {
             let at = FSPX_HEADER + 16 * i;
             if u32_at(part, at)? == kind {
                 let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
                 return bytes(part, offset.into(), size.into())
+                    .map(Some)
                     .ok_or(Malformed("FSPX entry out of bounds"));
             }
         }
-        Err(Malformed("FSPX entry missing"))
+        Ok(None)
     };
+    let entry = |kind: u32| find(kind)?.ok_or(Malformed("FSPX entry missing"));
     let packet = entry(FSPX_PACKET)?;
     let code = entry(FSPX_CODE)?;
     let meta = entry(FSPX_METADATA)?;
+    let roots = find(FSPX_ROOT_SIGNATURE)?;
     if u32_at(meta, 8)? as usize * 4 != code.len() {
         return Err(Malformed("FSPX code size disagrees"));
     }
@@ -505,9 +514,43 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    // With the pipeline's root signature, each constant takes its own `Num32BitValues`.
+    let sized = roots.and_then(root_constant_counts);
+    let (mut layout, used) = metadata_resources(meta, FSPX_RECORDS, |slot| match &sized {
+        // Guess (no readable root signature): 1 dword, widened by `expand_constants` below.
+        None => Ok(1),
+        Some(counts) => counts
+            .get(usize::from(slot))
+            .copied()
+            .flatten()
+            .ok_or("root constants the root signature does not size"),
+    })?;
     let rsrc2 = u32_at(packet, PACKET_RSRC2)?;
-    let (layout, used) =
-        metadata_resources(meta, FSPX_RECORDS, false, Some((rsrc2 >> 1 & 0x1F) as u8))?;
+    if sized.is_none() {
+        expand_constants(&mut layout);
+    } else {
+        // The constants' SGPRs are read as theirs before anything else: a count that runs into
+        // another parameter or past the user SGPRs (into the group ids) disagrees with the
+        // program.
+        let span = |p: &RootParam| u32::from(p.user_data)..u32::from(p.user_data) + p.sgprs;
+        for (i, p) in layout.iter().enumerate() {
+            if p.root != RootType::Constants {
+                continue;
+            }
+            let a = span(p);
+            let what = if a.end > rsrc2 >> 1 & 0x1F {
+                "root constants past the user SGPRs"
+            } else if layout.iter().enumerate().any(|(j, q)| {
+                let b = span(q);
+                i != j && a.start < b.end && b.start < a.end
+            }) {
+                "root constants overlapping another root parameter"
+            } else {
+                continue;
+            };
+            return Err(ShaderError::FspxRoot { root: 0, what });
+        }
+    }
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -523,15 +566,12 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
 }
 
 /// The root layout and used resources of the tagged records of an FSPX metadata blob, from byte
-/// `first` (compute: 0x18; graphics, whose header is 0x10 bytes: [`crate::emit::graphics`]).
-/// `graphics`: a root-constant record is one SGPR (the sampler index in a v2 header);
-/// `user_sgprs`: a compute program's user SGPRs ([`ComputeIo::user_sgprs`]), which bound the
-/// range of a compute root-constant record, since the system SGPRs follow them.
+/// `first` (compute: 0x18; graphics, whose header is 0x10 bytes: [`crate::emit::graphics`]);
+/// `constants`: the user-data dwords of the root constants of a slot, or why they are refused.
 pub(crate) fn metadata_resources(
     meta: &[u8],
     first: usize,
-    graphics: bool,
-    user_sgprs: Option<u8>,
+    constants: impl Fn(u8) -> Result<u32, &'static str>,
 ) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
@@ -562,21 +602,27 @@ pub(crate) fn metadata_resources(
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
-            // Root constants: one dword per record (graphics, observed: the sampler index, b500).
-            RootType::Constants if graphics => 1,
-            // A compute program's root constants: the range the record declares, cut to the
-            // user SGPRs the program has (observed: 4 declared dwords, of which the console
-            // places only the ones the code reads, before the system SGPRs).
-            RootType::Constants => match (u.dwords, user_sgprs) {
-                (0, _) => return Err(Malformed("an FSPX root constant range of no dwords")),
-                (dwords, Some(user)) => {
-                    u32::from(dwords).min(u32::from(user.saturating_sub(u.user_data)).max(1))
-                }
-                (dwords, None) => u32::from(dwords),
-            },
+            // Each record names its first user-data dword, so the count only says which SGPRs
+            // after it are the constant's: 1 for graphics (observed: the sampler index, b500)
+            // and compute without a root signature, widened by `expand_constants`; compute's
+            // root signature count otherwise. Guess: the N dwords are consecutive user SGPRs
+            // (docs/native-host.md, "Compute root constants").
+            RootType::Constants => {
+                constants(u.slot).map_err(|what| ShaderError::FspxRoot { root: e[5], what })?
+            }
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
-            _ => return Err(ShaderError::UnknownRootType(e[5].into())),
+            refused => {
+                return Err(ShaderError::FspxRoot {
+                    root: e[5],
+                    what: match refused {
+                        RootType::ResourceHeap | RootType::SamplerHeap => {
+                            "a descriptor heap (SM 6.6 dynamic resources)"
+                        }
+                        _ => "an unknown root type",
+                    },
+                });
+            }
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
             layout.push(RootParam {
@@ -591,6 +637,59 @@ pub(crate) fn metadata_resources(
         used.push(u);
     }
     Ok((layout, used))
+}
+
+/// Guess (graphics, and compute without a readable root signature; docs/native-host.md,
+/// "Compute root constants"). shortcut: multi-dword root constants are only expanded when the
+/// immediately following root signature slot (`slot + 1`) is also present in metadata; a
+/// trailing multi-dword constant block stays 1 SGPR until the register image is decoded.
+pub(crate) fn expand_constants(layout: &mut [RootParam]) {
+    for i in 0..layout.len() {
+        if layout[i].root != RootType::Constants {
+            continue;
+        }
+        let (slot, start) = (layout[i].slot, layout[i].user_data);
+        if let Some(next) =
+            layout.iter().find(|p| p.slot == slot.wrapping_add(1) && p.user_data > start)
+        {
+            let span = u32::from(next.user_data - start);
+            if span > layout[i].sgprs && span <= 32 {
+                layout[i].sgprs = span;
+            }
+        }
+    }
+}
+
+/// For each root parameter of a root signature blob (`RTS0`, bare or the part of a DXBC
+/// container), its `Num32BitValues` if it is root constants of 1 to 64 dwords; `None` if the
+/// blob does not read as `RTS0`.
+fn root_constant_counts(blob: &[u8]) -> Option<Vec<Option<u32>>> {
+    let rts0 = if blob.starts_with(b"DXBC") {
+        crate::Container::parse(blob)
+            .ok()?
+            .part(crate::FourCC::RTS0)?
+            .data
+    } else {
+        blob
+    };
+    let word = |at: usize| u32_at(rts0, at).ok();
+    // Versions 1.0 to 1.2 lay their parameters out alike.
+    if !(1..=3).contains(&word(0)?) {
+        return None;
+    }
+    // Metadata slots are bytes: later parameters are never asked for.
+    let (count, at) = (word(4)?.min(256) as usize, word(8)? as usize);
+    (0..count)
+        .map(|i| {
+            let param = at.checked_add(12 * i)?;
+            // D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS: register, space, Num32BitValues.
+            if word(param)? != 1 {
+                return Some(None);
+            }
+            let values = word((word(param + 8)? as usize).checked_add(8)?)?;
+            Some((1..=64).contains(&values).then_some(values))
+        })
+        .collect()
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -1223,6 +1322,18 @@ pub(crate) mod tests {
         wave32: bool,
         records: &[[u8; 32]],
     ) -> Vec<u8> {
+        fspx_with(code, rsrc2, threads, wave32, records, None)
+    }
+
+    /// [`fspx`] with the host's root signature entry if `root` is some.
+    pub(crate) fn fspx_with(
+        code: &[u8],
+        rsrc2: u32,
+        threads: [u16; 3],
+        wave32: bool,
+        records: &[[u8; 32]],
+        root: Option<&[u8]>,
+    ) -> Vec<u8> {
         let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let flags = if wave32 { PACKET_WAVE32 } else { 0 };
         let packet = words(&[
@@ -1249,12 +1360,13 @@ pub(crate) mod tests {
             .for_each(|r| meta.extend_from_slice(r));
         let len = meta.len() as u32 - 0x14;
         meta[4..8].copy_from_slice(&len.to_le_bytes());
-        let blobs: [(u32, &[u8]); 4] = [
+        let mut blobs: Vec<(u32, &[u8])> = vec![
             (FSPX_PACKET, &packet),
             (1, &[0; 0x14]),
             (FSPX_CODE, code),
             (FSPX_METADATA, &meta),
         ];
+        blobs.extend(root.map(|r| (FSPX_ROOT_SIGNATURE, r)));
         let mut out = vec![0u8; FSPX_HEADER + 16 * blobs.len()];
         for (i, (kind, blob)) in blobs.iter().enumerate() {
             let at = out.len().next_multiple_of(16);
@@ -1266,11 +1378,98 @@ pub(crate) mod tests {
         let header = words(&[
             u32::from_le_bytes(*b"FSPX"),
             FSPX_VERSION,
-            4,
+            blobs.len() as u32,
             out.len() as u32,
         ]);
         out[..16].copy_from_slice(&header);
         out
+    }
+
+    /// A version 1.0 `RTS0` blob of `params`, each (parameter type, `Num32BitValues` of a
+    /// constants parameter); a table has no range.
+    pub(crate) fn rts0(params: &[(u32, u32)]) -> Vec<u8> {
+        let n = params.len() as u32;
+        let mut head = vec![1, n, 24, 0, 0, 0];
+        let mut tail = Vec::new();
+        for (i, &(kind, values)) in params.iter().enumerate() {
+            head.extend([kind, 0, 24 + 12 * n + 12 * i as u32]);
+            tail.extend([0, 0, values]);
+        }
+        head.iter()
+            .chain(&tail)
+            .flat_map(|w| w.to_le_bytes())
+            .collect()
+    }
+
+    /// Compute root constants take their root signature's dword count where the guess
+    /// (`expand_constants`) is wrong: b0 is followed by a gap (the guess takes s2..s3), b1 by a
+    /// table two slots on (the guess leaves it one dword). The table keeps its own user data.
+    #[test]
+    fn fspx_root_constants_are_sized_by_the_root_signature() {
+        let code = [0x00, 0x00, 0x81, 0xBF];
+        // b0 (1 dword) at s2, b1 (4 dwords) at s4..s7, a UAV table (slot 3) at s8; 9 user SGPRs.
+        let records = [
+            fspx_resource(2, 0, 0, 0, 2, 0),
+            fspx_resource(2, 0, 0, 1, 4, 1),
+            fspx_resource(3, 3, 0, 0, 8, 3),
+        ];
+        let program = |root: Option<&[u8]>| {
+            native_programs(&fspx_with(&code, 9 << 1, [64, 1, 1], false, &records, root))
+        };
+        let roots = |p: &NativeProgram| -> Vec<_> {
+            p.layout
+                .iter()
+                .map(|r| (r.root, r.sgprs, r.user_data, r.slot))
+                .collect()
+        };
+        let root = rts0(&[(1, 1), (1, 4), (0, 0), (0, 0)]);
+        let p = &program(Some(&root)).unwrap()[0];
+        assert_eq!(
+            roots(p),
+            [
+                (RootType::Constants, 1, 2, 0),
+                (RootType::Constants, 4, 4, 1),
+                (RootType::Table, 1, 8, 3)
+            ]
+        );
+        // The same blob in a DXBC container.
+        let container = crate::dxbc::build(&[(crate::FourCC::RTS0, &root)]);
+        assert_eq!(program(Some(&container)).unwrap()[0].layout, p.layout);
+        // Without a root signature, or with one that does not read as RTS0: the guess.
+        let guess = [
+            (RootType::Constants, 2, 2, 0),
+            (RootType::Constants, 1, 4, 1),
+            (RootType::Table, 1, 8, 3),
+        ];
+        assert_eq!(roots(&program(None).unwrap()[0]), guess);
+        assert_eq!(roots(&program(Some(&root[..40])).unwrap()[0]), guess);
+        let refusal = |root: &[u8]| program(Some(root)).unwrap_err().to_string();
+        let what = |w: &str| format!("FSPX metadata resource of root type 0: {w}");
+        let not_sized = what("root constants the root signature does not size");
+        for root in [
+            rts0(&[(1, 1), (0, 0), (0, 0), (0, 0)]),  // slot 1 is a table
+            rts0(&[(1, 1)]),                          // slot 1 is missing
+            rts0(&[(1, 1), (1, 0), (0, 0), (0, 0)]),  // no dwords
+            rts0(&[(1, 1), (1, 65), (0, 0), (0, 0)]), // more than a root signature holds
+        ] {
+            assert_eq!(refusal(&root), not_sized);
+        }
+        let overlap = what("root constants overlapping another root parameter");
+        assert_eq!(refusal(&rts0(&[(1, 1), (1, 5), (0, 0), (0, 0)])), overlap);
+        assert_eq!(refusal(&rts0(&[(1, 3), (1, 4), (0, 0), (0, 0)])), overlap);
+        // b1 alone, 6 dwords from s4 with 9 user SGPRs: s9 is a group id.
+        let past = native_programs(&fspx_with(
+            &code,
+            9 << 1,
+            [64, 1, 1],
+            false,
+            &records[1..2],
+            Some(&rts0(&[(1, 1), (1, 6)])),
+        ));
+        assert_eq!(
+            past.unwrap_err().to_string(),
+            what("root constants past the user SGPRs")
+        );
     }
 
     #[test]
@@ -1320,55 +1519,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reads_fspx_compute_root_constants() {
-        let code = [0x00, 0x00, 0x81, 0xBF]; // s_endpgm
-        // A root constant range at b502, filled from user data 4 (slot 1), 8 user SGPRs: the
-        // four dwords the record declares are all user data.
-        let data = fspx(
-            &code,
-            8 << 1,
-            [64, 1, 1],
-            false,
-            &[fspx_resource(2, 0, 0, 502, 4, 1)],
-        );
-        let p = &native_programs(&data).unwrap()[0];
-        assert_eq!(
-            p.layout,
-            [RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 4,
-                base_register: 502,
-                user_data: 4,
-                slot: 1
-            }]
-        );
-        assert_eq!(
-            (p.used[0].kind, p.used[0].root, p.used[0].dwords),
-            (ResourceType::Cbv, RootType::Constants, 4)
-        );
-
-        // The record at the last user SGPR: the console places one dword before the system
-        // SGPRs, however many the record declares.
-        let one = fspx(
-            &code,
-            5 << 1,
-            [64, 1, 1],
-            false,
-            &[fspx_resource(2, 0, 0, 502, 4, 1)],
-        );
-        assert_eq!(native_programs(&one).unwrap()[0].layout[0].sgprs, 1);
-
-        // A range of no dwords cannot fill a user SGPR.
-        let mut none = fspx_resource(2, 0, 0, 502, 4, 1);
-        none[20] = 0;
-        assert_eq!(
-            native_programs(&fspx(&code, 8 << 1, [64, 1, 1], false, &[none])).unwrap_err(),
-            Malformed("an FSPX root constant range of no dwords")
-        );
-    }
-
-    #[test]
     fn rejects_corrupt_fspx_parts() {
         let code = [0x00, 0x00, 0x81, 0xBF];
         let good = fspx(&code, 0, [64, 1, 1], false, &[]);
@@ -1381,19 +1531,55 @@ pub(crate) mod tests {
         assert!(corrupt(8, 0xFF).is_err(), "entry count");
         // The code entry's size no longer matches the metadata's count.
         assert!(corrupt(FSPX_HEADER + 32 + 8, 8).is_err(), "code size");
-        let mut unknown = fspx(
+        // Each refused root type names itself (after an accepted table).
+        let refusal = |root: u8| {
+            let records = [
+                fspx_resource(0, 3, 0, 0, 4, 0),
+                fspx_resource(2, root, 0, 0, 5, 1),
+            ];
+            native_programs(&fspx(&code, 0, [64, 1, 1], false, &records))
+                .unwrap_err()
+                .to_string()
+        };
+        for (root, what) in [
+            (5, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (6, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (2, "an unknown root type"),
+            (7, "an unknown root type"),
+        ] {
+            assert_eq!(
+                refusal(root),
+                format!("FSPX metadata resource of root type {root}: {what}")
+            );
+        }
+        let mut root_constants = fspx(
             &code,
             0,
             [64, 1, 1],
             false,
-            &[fspx_resource(2, 7, 0, 0, 4, 0)],
+            &[fspx_resource(2, 0, 0, 0, 4, 0)],
         );
-        assert_eq!(
-            native_programs(&unknown).unwrap_err(),
-            ShaderError::UnknownRootType(7),
-            "unknown root type, named by its value"
-        );
-        unknown.truncate(40);
-        assert!(native_programs(&unknown).is_err(), "truncated");
+        root_constants.truncate(40);
+        assert!(native_programs(&root_constants).is_err(), "truncated");
+    }
+
+    /// Root constants (root type 0) in a compute shader were refused as
+    /// "root constants in a compute shader"; they take user SGPRs as in a
+    /// graphics shader, spanning up to the next parameter's first one.
+    #[test]
+    fn compute_root_constants_take_their_user_sgprs() {
+        let code = [0x00, 0x00, 0x81, 0xBF];
+        let records = [
+            fspx_resource(2, 0, 0, 0, 0, 0),
+            fspx_resource(3, 3, 0, 0, 4, 1),
+        ];
+        let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &records)).unwrap()[0];
+        let layout: Vec<_> = p.layout.iter().map(|r| (r.root, r.user_data, r.sgprs)).collect();
+        assert_eq!(layout, [(RootType::Constants, 0, 4), (RootType::Table, 4, 1)]);
+        assert_eq!(p.used.len(), 2);
+        // Trailing constants stay one dword (a guess, as in graphics).
+        let trailing = [fspx_resource(3, 3, 0, 0, 0, 0), fspx_resource(2, 0, 0, 0, 1, 1)];
+        let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &trailing)).unwrap()[0];
+        assert_eq!(p.layout[1].sgprs, 1);
     }
 }

@@ -22,16 +22,21 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 **Now:**
 - At about 53 s (about 1,400 frames) a Metal command buffer fails with `kIOGPUCommandBufferCallbackErrorTimeout`. A fence is left one step behind (signal 2836, GPU at 2832) and presents stop. One way to get there is fixed: Metal ends a command buffer whose fence wait lasts about 5 s and drops its signals, so all unsatisfied queue `Wait`s are now held on the CPU until observed backend completion, including waits behind already-committed signals, since those producers can still be delayed or fail asynchronously (docs/native-host.md). Not confirmed as this time-out's cause; recent tester runs (#13, #26) pass 53 s.
-- The keyboard now drives the stand-in pad in the window (Enter/Space = A, Esc = B, arrows = D-pad, WASD = left stick). Real controllers through the Game Controller framework are still a self-contained task.
+- The keyboard now drives the stand-in pad in the window (Enter/Space = A, Esc = B, arrows = D-pad, WASD = left stick). Game Controller framework pads drive it too (Xbox, DualShock 4, DualSense; the one used last wins, and a PlayStation touchpad click is View). The DualShock 4 mapping is tested against a software gamepad only: a tester run with a real one in the menus is still needed.
 
 **Start here:** `crates/victory-gpu/src/native/` and `queue.rs` for the timeout; `crates/victory-hle/src/modules/gameinput.rs` and `apps/victory/src/window.rs` for input.
 
 ## 3. Shader translation gaps
 
-Seven shader shapes are still refused, on the guessed path:
-- pixel: "a computed buffer descriptor used as a view" ×3, "a hardware SGPR input" ×1;
-  (the first comes only from image instructions: a sampler whose state words are computed, now reported as "a sampler built from computed words", or a 128-bit image descriptor built in code; the address logged is the first use of the result, see docs/native-host.md, "Computed pixel buffers");
-- vertex: "an address in an SGPR that is no root parameter" ×3.
+Refused shaders drop their draws and dispatches. Unique shaders refused in the story-load run of 26 November, by reason (the counts are from before the fixes marked "since", which are not re-measured):
+- compute, "FSPX metadata resource of root type 0: root constants in a compute shader": about 70 to 78. Since: accepted, as in graphics.
+- compute, "a typed buffer store of some channels or at an offset": about 20. Since: stores of fewer channels lower; a store at an offset stays refused as "a typed buffer store at an offset", because a typed view cannot address inside an element.
+- "a structured buffer of unknown stride": about 13. Since: an indexed table buffer takes its stride from the view-stride table (FSPX metadata gives none).
+- "a buffer descriptor built around a computed address": about 12. Since: loads in compute lower through title memory; stores, atomics and typed access stay refused.
+- scalar `s_pack_*_b32_b16` and `s_bitreplicate_b64_b32`: small. Since: lowered.
+- Since #69: an address in an undeclared SGPR pair tracks as title memory, and the guessed layout declares the pair as root constants, so the vertex shaders' "an address in an SGPR that is no root parameter" lower (docs/native-host.md, "Undeclared SGPR addresses").
+- Older, small: pixel "a computed buffer descriptor used as a view" (a sampler or 128-bit image descriptor built in code, see docs/native-host.md, "Computed pixel buffers"), "a hardware SGPR input", and vertex "an address in an SGPR that is no root parameter".
+- "an unknown root type" (FSPX root types 2 and 7+): none in the story-load run of 27 November. The "about 70 to 78" first counted under that name were root type 0 (the message did not give the number then; see docs/native-host.md, "Guessed graphics pipelines", Metadata). Types 2 and 7+ stay refused until a shader with one is seen.
 
 **Start here:** `crates/victory-shader/src/emit/`. Tests use hand-assembled GFX10 code (`gfx_refusal_tests.rs`).
 

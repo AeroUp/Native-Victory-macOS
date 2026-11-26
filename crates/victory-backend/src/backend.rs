@@ -62,6 +62,12 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub heaps: Heaps<'a, B>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
+    /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
+    /// words) instead of `groups`.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
+    /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
+    /// The record runs only if the index is below the count, which the GPU reads when it runs.
+    pub count: Option<(&'a B::Buffer, *const u8, u32)>,
 }
 
 /// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.
@@ -120,6 +126,8 @@ pub trait ComputeBackend {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Self::Pipeline, String>;
+    /// Names a pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_pipeline(&self, _p: &Self::Pipeline, _name: &str) {}
     /// Queue the work and return; never waits for the GPU.
     fn submit(&self, queue: &Self::Queue, work: &Submission<'_, Self>) -> Result<(), String>;
     /// `ID3D12Fence::Signal` from the CPU: queues waiting for `value` go on.

@@ -26,7 +26,7 @@ use crate::gfx10::{Fields, Instruction, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
 use crate::native::{
     HwStage, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage, VsOutput,
-    metadata_resources,
+    expand_constants, metadata_resources,
 };
 
 /// The part a graphics piece pair is carried in: `"FSPG"`, u32 stage (0 vertex, 1 pixel), u32
@@ -106,7 +106,7 @@ fn infer(
     }
     let list = crate::gfx10::decode(code)?;
     let wave64 = infer_wave64(&list);
-    let (mut layout, mut used) = metadata_resources(meta, RECORDS, true, None)?;
+    let (mut layout, mut used) = metadata_resources(meta, RECORDS, |_| Ok(1))?;
     // The registers the program names: its VGPR count, and what it reads on entry.
     let p = crate::ir::build(code, wave64, 256)?;
     if stage == HwStage::Vs
@@ -134,23 +134,7 @@ fn infer(
             }
         }
     }
-    // shortcut: multi-dword root constants are only expanded when the immediately following
-    // root signature slot (`slot + 1`) is also present in metadata; a trailing multi-dword
-    // constant block stays 1 SGPR until the register image is decoded.
-    for i in 0..layout.len() {
-        if layout[i].root != RootType::Constants {
-            continue;
-        }
-        let (slot, start) = (layout[i].slot, layout[i].user_data);
-        if let Some(next) =
-            layout.iter().find(|p| p.slot == slot.wrapping_add(1) && p.user_data > start)
-        {
-            let span = u32::from(next.user_data - start);
-            if span > layout[i].sgprs && span <= 32 {
-                layout[i].sgprs = span;
-            }
-        }
-    }
+    expand_constants(&mut layout);
     let occupied = |layout: &[RootParam], reg: u8| {
         let r = u32::from(reg);
         layout
@@ -189,6 +173,31 @@ fn infer(
                 base_register: 0,
                 user_data,
                 slot: VERTEX_TABLE,
+            });
+        }
+    }
+    // An address in a live-in SGPR pair no parameter fills is title memory
+    // (guessed: the console's user data carries raw addresses). Declare the
+    // pair as root constants so lowering can read it from the user-data
+    // block instead of refusing the SGPR read.
+    // shortcut: the slot is the first free one; the register image does not
+    // yet say which root parameter holds the pair.
+    if let Ok(res) = crate::resource::track(&p, &layout, stage, None) {
+        for n in res.memory_inputs {
+            if occupied(&layout, n) || occupied(&layout, n + 1) {
+                continue;
+            }
+            let Some(slot) = (0..252u16).find(|s| !layout.iter().any(|p| p.slot == *s as u8))
+            else {
+                continue;
+            };
+            layout.push(RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: n,
+                slot: slot as u8,
             });
         }
     }
@@ -918,7 +927,7 @@ mod tests {
         assert!(!p2.layout.iter().any(|r| r.slot == VERTEX_TABLE && r.user_data == 0));
 
         // Genuinely unknown SGPR address (non-descriptor s_load_dword from s[6:7]) is NOT promoted
-        // and still fails resource::track with "an address in an SGPR that is no root parameter".
+        // to a root parameter; it tracks as a title-memory address.
         let unknown = words(&[
             0xF400_0203,
             0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
@@ -928,13 +937,12 @@ mod tests {
         ]);
         let (p3, _) = infer(HwStage::Vs, &unknown, &meta_s0).unwrap();
         let ir = crate::ir::build(&p3.code, p3.wave64, p3.vgprs).unwrap();
-        let err = crate::resource::track(&ir, &p3.layout, p3.stage, None).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                offset: 0,
-                what: "an address in an SGPR that is no root parameter",
-            }
+        let r = crate::resource::track(&ir, &p3.layout, p3.stage, None).unwrap();
+        assert!(
+            r.scalar
+                .iter()
+                .any(|&(_, a)| a.param == crate::resource::MEMORY),
+            "{r:?}"
         );
     }
 }

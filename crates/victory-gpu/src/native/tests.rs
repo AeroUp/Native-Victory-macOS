@@ -482,6 +482,68 @@ fn a_draw_with_no_render_target_is_dropped_alone() {
     assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
 }
 
+/// `ExecuteIndirect` with a count buffer: three dispatch records (2, 4 and 8 groups), and the count
+/// of records to run (2) written by a copy earlier in the same list, both read on the GPU when the
+/// dispatches run: only the first two run, so 256 values are written, not 512 (or none, if the
+/// count were read before the copy).
+#[test]
+fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, records, staged, count) = (0, 16384, 32768, 32816, 32832);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0u32; N]);
+    pool.write(records, &[2u32, 1, 1, 4, 1, 1, 8, 1, 1]);
+    pool.write(staged, &[2u32]);
+    pool.write(count, &[0u32]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(count), pool.va(staged), 4);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, pool.va(src));
+    l.set_compute_root_view(2, pool.va(dst));
+    for i in 0..3 {
+        l.dispatch_indirect_counted(pool.va(records + 12 * i as usize), pool.va(count), i)
+            .unwrap();
+    }
+    run(&h, &[&l]);
+
+    let out: Vec<u32> = pool.read(dst, N);
+    let want: Vec<u32> = (0..N as u32)
+        .map(|i| if i < 256 { i * 5 + 7 } else { 0 })
+        .collect();
+    assert_eq!(out, want);
+}
+
+/// `ExecuteIndirect` of a dispatch: the record is read on the GPU when the dispatch runs, so a copy
+/// earlier in the same list that writes it (as a culling pass would) decides the group count.
+#[test]
+fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, staged, record) = (0, 16384, 32768, 32800);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0u32; N]);
+    pool.write(staged, &[(N / 128) as u32, 1, 1]);
+    pool.write(record, &[0u32; 3]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(record), pool.va(staged), 12);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, pool.va(src));
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch_indirect(pool.va(record)).unwrap();
+    run(&h, &[&l]);
+
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..8]);
+    assert!(out[N / 2..].iter().all(|v| *v == 0), "only the record's groups ran");
+}
+
 /// A command that names title memory outside every mapped pool is not encoded (no GPU fault) and
 /// is dropped by itself: the value writes, and the dispatch, recorded around it still run.
 #[test]

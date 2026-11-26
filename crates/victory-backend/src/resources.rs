@@ -538,6 +538,12 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub vertex_buffers: Vec<(&'a B::Buffer, *const u8)>,
     pub index_buffer: Option<(&'a B::Buffer, *const u8)>,
     pub call: DrawCall,
+    /// `ExecuteIndirect`: the call's counts are read on the GPU from this title address (the
+    /// D3D12 argument records are Metal's indirect ones), and `call` gives only its kind.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
+    /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
+    /// The record runs only if the index is below the count, which the GPU reads when it runs.
+    pub count: Option<(&'a B::Buffer, *const u8, u32)>,
 }
 
 pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {

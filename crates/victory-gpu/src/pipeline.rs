@@ -654,7 +654,8 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
 /// 0x60-byte record, the pieces an `FSPX` part is made of (observed at run time, as the console
 /// runtime takes them): pointer and size of the pipeline registers (kind 0, 0x1c bytes), of the
 /// hash (kind 1, 0x14), of the GFX10 code (kind 6) and of the metadata (kind 7); more fields
-/// follow that are not read.
+/// follow that are not read. The root signature's blob goes into the part too
+/// ([`victory_shader::native::FSPX_ROOT_SIGNATURE`]): it sizes the program's root constants.
 pub(crate) extern "system" fn create_compute_pieces(
     _: This,
     desc: *const u8,
@@ -667,7 +668,9 @@ pub(crate) extern "system" fn create_compute_pieces(
     #[cfg(target_os = "macos")]
     {
         // SAFETY: the title passes a description of this layout.
-        if let Some(container) = unsafe { compute_container(desc.add(8)) } {
+        let root = crate::root::blob_of(unsafe { desc.cast::<This>().read_unaligned() });
+        // SAFETY: as above.
+        if let Some(container) = unsafe { compute_container(root.as_deref(), desc.add(8)) } {
             return hand_out(
                 vec![shader("compute", &container)],
                 #[cfg(windows)]
@@ -681,14 +684,15 @@ pub(crate) extern "system" fn create_compute_pieces(
     create_unread_at(0x218, desc, iid, out)
 }
 
-/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]).
+/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]),
+/// and of the root signature blob `root` if there is one.
 ///
 /// # Safety
 /// `record` points at four (pointer, size) pairs.
 #[cfg(target_os = "macos")]
-unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
+unsafe fn compute_container(root: Option<&[u8]>, record: *const u8) -> Option<Vec<u8>> {
     const KINDS: [u32; 4] = [0, 1, 6, 7];
-    let mut part = vec![0u8; 0x10 + 16 * KINDS.len()];
+    let mut pieces: Vec<(u32, &[u8])> = Vec::with_capacity(KINDS.len() + 1);
     for (i, kind) in KINDS.into_iter().enumerate() {
         // SAFETY: as the caller says.
         let (ptr, size) = unsafe {
@@ -700,14 +704,24 @@ unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
         if ptr == 0 || size == 0 || size > 1 << 22 {
             return None;
         }
+        // SAFETY: the title's piece of `size` bytes.
+        pieces.push((kind, unsafe {
+            std::slice::from_raw_parts(ptr as *const u8, size)
+        }));
+    }
+    pieces.extend(root.map(|r| (victory_shader::native::FSPX_ROOT_SIGNATURE, r)));
+    let mut part = vec![0u8; 0x10 + 16 * pieces.len()];
+    for (i, (kind, bytes)) in pieces.iter().enumerate() {
         let at = part.len().next_multiple_of(16);
         part.resize(at, 0);
-        let entry: Vec<u8> = [kind, at as u32, size as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let entry: Vec<u8> = [*kind, at as u32, bytes.len() as u32, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         part[0x10 + 16 * i..0x20 + 16 * i].copy_from_slice(&entry);
-        // SAFETY: the title's piece of `size` bytes.
-        part.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) });
+        part.extend_from_slice(bytes);
     }
-    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, KINDS.len() as u32, part.len() as u32]
+    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, pieces.len() as u32, part.len() as u32]
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
@@ -1330,6 +1344,69 @@ mod tests {
 mod pieces_tests {
     use super::*;
 
+    /// The container the host makes from a compute description's pieces: wave32 code of 32
+    /// threads with 5 user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
+    fn container_of(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
+        let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
+        let code = words(code);
+        let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        metadata.extend([0x40, 4, records.len() as u8, 0]);
+        records.iter().for_each(|r| metadata.extend(r));
+        metadata.extend([0x43].into_iter().chain([0; 31]));
+        let size = metadata.len() as u32 - 0x14;
+        metadata[4..8].copy_from_slice(&size.to_le_bytes());
+        let pieces = [registers, vec![0; 0x14], code, metadata];
+        let mut record = Vec::new();
+        for p in &pieces {
+            record.extend((p.as_ptr() as u64).to_le_bytes());
+            record.extend((p.len() as u64).to_le_bytes());
+        }
+        // SAFETY: four pairs over live vectors.
+        unsafe { compute_container(None, record.as_ptr()) }.expect("a container")
+    }
+
+    /// On the native host's path (the container made from the title's pieces, translated with
+    /// the host's options: two host waves of 32 lanes, title memory zero-copy), a whole-wave
+    /// section value without a shape is refused naming the first step the simulation does not
+    /// model; that text is what the refusal log line shows.
+    #[test]
+    fn the_host_refuses_a_whole_wave_section_naming_its_step() {
+        // A raw UAV of the table at user data 4 (`s4`).
+        let mut uav = [0u8; 32];
+        uav[0] = 0x41;
+        uav[4..6].copy_from_slice(&[3, 3]);
+        uav[16] = 1;
+        uav[20..23].copy_from_slice(&[4, 4, 0]);
+        let program = |step: &[u32]| {
+            let mut code = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+            ];
+            code.extend_from_slice(step);
+            code.extend([
+                0xBEFE_0302, // s_mov_b32 exec_lo, s2
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ]);
+            container_of(&code, &[uav])
+        };
+        let prefix = "a whole-wave section step the simulation does not follow: ";
+        for (step, why) in [
+            (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+            // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
+            (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+        ] {
+            let err = crate::native::shaders::translate(&program(step)).err().expect("refused");
+            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+        }
+    }
+
     /// Four (pointer, size) pairs of a console compute description's record, as the title lays
     /// them out: registers, hash, code, metadata.
     #[test]
@@ -1340,22 +1417,77 @@ mod pieces_tests {
             record.extend((p.as_ptr() as u64).to_le_bytes());
             record.extend((p.len() as u64).to_le_bytes());
         }
+        let root = [5u8; 0x24];
         // SAFETY: four pairs over live vectors.
-        let container = unsafe { compute_container(record.as_ptr()) }.expect("a container");
+        let container =
+            unsafe { compute_container(Some(&root), record.as_ptr()) }.expect("a container");
         let parsed = victory_shader::Container::parse(&container).unwrap();
         let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
         let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(&part[..4], b"FSPX");
-        assert_eq!((word(4), word(8), word(12)), (1, 4, part.len()));
-        for (i, (kind, piece)) in [0u32, 1, 6, 7].into_iter().zip(&pieces).enumerate() {
+        assert_eq!((word(4), word(8), word(12)), (1, 5, part.len()));
+        let rts0 = victory_shader::native::FSPX_ROOT_SIGNATURE;
+        let all = pieces.iter().map(Vec::as_slice).chain([&root[..]]);
+        for (i, (kind, piece)) in [0u32, 1, 6, 7, rts0].into_iter().zip(all).enumerate() {
             let at = 0x10 + 16 * i;
             assert_eq!(word(at), kind as usize);
             let (offset, size) = (word(at + 4), word(at + 8));
-            assert_eq!(&part[offset..offset + size], &piece[..]);
+            assert_eq!(&part[offset..offset + size], piece);
         }
+        // Without a root signature, the four pieces alone.
+        // SAFETY: as above.
+        let bare = unsafe { compute_container(None, record.as_ptr()) }.expect("a container");
+        let parsed = victory_shader::Container::parse(&bare).unwrap();
+        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        assert_eq!(u32::from_le_bytes(part[8..12].try_into().unwrap()), 4);
         // A missing piece is no container.
         record[16..24].copy_from_slice(&0u64.to_le_bytes());
         // SAFETY: as above.
-        assert!(unsafe { compute_container(record.as_ptr()) }.is_none());
+        assert!(unsafe { compute_container(Some(&root), record.as_ptr()) }.is_none());
+    }
+
+    /// On the native host's path (the container made from the title's pieces, translated with
+    /// the host's options), a buffer descriptor's dword that is no size, read as data, is refused
+    /// naming the dword; that text is what the refusal log line shows.
+    #[test]
+    fn the_host_refuses_a_descriptor_dword_read_as_data_naming_it() {
+        // A table at user data 4 (`s4`): a raw UAV at dword 0, the buffer read at dword 8.
+        let table = |kind: u8, offset: u8| {
+            let mut r = [0u8; 32];
+            r[0] = 0x41;
+            r[4..6].copy_from_slice(&[kind, 3]);
+            r[8] = offset;
+            r[16] = 1;
+            r[20..23].copy_from_slice(&[4, 4, 0]);
+            r
+        };
+        let program = |read: u32| {
+            let code = [
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xF408_0302,
+                0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xE030_1000,
+                0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+                read,        // v_mov_b32 v2, s<12 + n>
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ];
+            container_of(&code, &[table(3, 0), table(0, 8)])
+        };
+        let prefix = "a descriptor's address or format read as data: ";
+        for (read, why) in [
+            (0x7E04_020C, "a buffer's base address (dword 0)"),
+            (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+            (0x7E04_020F, "a buffer's dword 3 (format and type)"),
+        ] {
+            let err = crate::native::shaders::translate(&program(read)).err().expect("refused");
+            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+        }
     }
 }

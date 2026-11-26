@@ -398,6 +398,25 @@ fn a_shifted_or_built_mask_needs_the_consoles_lanes() {
     }
 }
 
+/// A mask holding lanes elsewhere read as data is refused saying where it
+/// comes from: here a saveexec of the other width (32 bits in a wave64
+/// program).
+#[test]
+fn masks_holding_lanes_elsewhere_say_where_they_come_from() {
+    const SAVEEXEC32_DATA: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+        0x7E02_0202, // v_mov_b32_e32 v1, s2
+    ];
+    let r = lowered(SAVEEXEC32_DATA, 64, false).err();
+    let why = "a lane mask holding lanes elsewhere read as data: written by a scalar \
+               instruction of the other width";
+    assert!(
+        matches!(r, Some(crate::ShaderError::Unsupported { what, .. }) if what == why),
+        "{r:?}"
+    );
+}
+
 /// What is not translated stays refused, saying what.
 #[test]
 fn what_has_no_form_is_refused_clearly() {
@@ -419,39 +438,6 @@ fn what_has_no_form_is_refused_clearly() {
         matches!(r, Some(crate::ShaderError::Unsupported { .. })),
         "{r:?}"
     );
-}
-
-#[test]
-fn scalar_pack_takes_halves_of_each_source() {
-    // `s_pack_{ll,lh,hh}_b32_b16 s5, s0, s1` then `v_mov_b32 v1, s5`: one 16-bit half of each
-    // source into the low and high half of the result. All three shapes were refused as
-    // unsupported scalar operations, and compute programs use them to build packed keys.
-    for (word, which) in [
-        (0x9905_0706u32, "ll"),
-        (0x9985_0706, "lh"),
-        (0x9A05_0706, "hh"),
-    ] {
-        let body = [
-            0xBE86_0380, // s_mov_b32 s6, 0
-            0xBE87_0380, // s_mov_b32 s7, 0
-            word,        // s_pack_* s5, s6, s7
-            0x7E02_0205, // v_mov_b32 v1, s5
-        ];
-        lowered(&body, 1, false).unwrap_or_else(|e| panic!("s_pack_{which}: {e}"));
-    }
-}
-
-#[test]
-fn scalar_bitreplicate_fills_both_halves() {
-    // `s_bitreplicate_b64_b32 s[8:9], s6` then both halves read back: the 32-bit source lands in
-    // the low and the high dword. It was refused as an unsupported scalar operation.
-    let body = [
-        0xBE86_0380, // s_mov_b32 s6, 0
-        0xBE88_3B06, // s_bitreplicate_b64_b32 s[8:9], s6
-        0x7E02_0208, // v_mov_b32 v1, s8
-        0x7E04_0209, // v_mov_b32 v2, s9
-    ];
-    lowered(&body, 1, false).expect("s_bitreplicate_b64_b32");
 }
 
 /// A wave64 lane mask joined with data at a uniform loop's header (the

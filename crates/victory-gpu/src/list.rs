@@ -1939,7 +1939,9 @@ extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u6
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
 /// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
+/// through the host's indirect execution (`State::execute_indirect`), and
+/// on the native host as Metal indirect draws and dispatches that read the
+/// records in title memory (`native::glue::execute_indirect`).
 /// shortcut: signatures that change root arguments are dropped (logged
 /// once per signature).
 extern "system" fn execute_indirect(
@@ -1972,7 +1974,19 @@ extern "system" fn execute_indirect(
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
-    } else {
+    }
+    // A count buffer (D3D12 runs min(count, max) records) is read on the GPU too: each record
+    // past it is turned into one that does nothing first (`victory_metal` gates them).
+    #[cfg(target_os = "macos")]
+    if let (Some(command), Some(address), true) = (
+        crate::signature::command(stride, args),
+        address,
+        count.is_null() || counter.is_some(),
+    ) {
+        ran = crate::native::glue::execute_indirect(this, command, stride, max, address, counter);
+    }
+    #[cfg(windows)]
+    if !ran {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",

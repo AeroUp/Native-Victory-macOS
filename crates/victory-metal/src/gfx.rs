@@ -197,6 +197,39 @@ pub struct RenderPipeline {
     raster: Raster,
     /// The pipeline's target has a stencil plane (the pass attaches it too).
     stencil: bool,
+    /// Each stage's static samplers, which the stage's argument buffer points at.
+    vs_static: Option<StaticSamplers>,
+    ps_static: Option<StaticSamplers>,
+}
+
+/// One shader stage's static samplers, as Apple's converter reads them: not built into the
+/// shader, but one table of `IRDescriptorTableEntry` (sampler, 0, LOD bias), `s0` first, whose
+/// address the stage's top-level argument buffer holds at `offset`, right after the root
+/// parameters. Nothing wrote that address before: the shader read a sampler through whatever
+/// bytes followed the parameters, which sampled zeros on M1 and M2 (Apple7, Apple8) GPUs and
+/// left the window black at the title's present pass (Native-Victory-macOS #26).
+pub(crate) struct StaticSamplers {
+    table: Retained<ProtocolObject<dyn MTLBuffer>>,
+    offset: usize,
+    /// The table holds only their resource IDs.
+    _samplers: Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+}
+
+impl StaticSamplers {
+    /// `root` with the table's address at its offset.
+    fn args<'a>(t: Option<&Self>, root: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let Some(t) = t else { return root.into() };
+        let mut v = root.to_vec();
+        if v.len() < t.offset + 8 {
+            v.resize(t.offset + 8, 0);
+        }
+        v[t.offset..t.offset + 8].copy_from_slice(&t.table.gpuAddress().to_le_bytes());
+        v.into()
+    }
+
+    fn table(t: Option<&Self>) -> Option<&ProtocolObject<dyn MTLResource>> {
+        t.map(|t| ProtocolObject::from_ref(&*t.table))
+    }
 }
 
 fn pixel_format(f: Format) -> MTLPixelFormat {
@@ -340,6 +373,86 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
         Filter::Nearest => MTLSamplerMinMagFilter::Nearest,
         Filter::Linear => MTLSamplerMinMagFilter::Linear,
     }
+}
+
+/// A sampler for a static sampler's `D3D12_STATIC_SAMPLER_DESC` words up to `MaxLOD` (filter,
+/// address U, V, W, LOD bias, anisotropy, comparison, border, minimum and maximum LOD). The LOD
+/// bias is the table entry's. Minimum and maximum filtering (filter bits 0x100) have no
+/// equivalent here and filter normally.
+fn static_sampler(
+    dev: &ProtocolObject<dyn MTLDevice>,
+    w: &[u32; 10],
+) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, String> {
+    let [
+        filter,
+        u,
+        v,
+        ww,
+        _,
+        anisotropy,
+        comparison,
+        border,
+        min_lod,
+        max_lod,
+    ] = *w;
+    let aniso = filter & 0x40 != 0;
+    let linear = |bit: u32| {
+        if aniso || filter & bit != 0 {
+            MTLSamplerMinMagFilter::Linear
+        } else {
+            MTLSamplerMinMagFilter::Nearest
+        }
+    };
+    let mode = |m: u32| match m {
+        1 => MTLSamplerAddressMode::Repeat,
+        2 => MTLSamplerAddressMode::MirrorRepeat,
+        4 => MTLSamplerAddressMode::ClampToBorderColor,
+        5 => MTLSamplerAddressMode::MirrorClampToEdge,
+        _ => MTLSamplerAddressMode::ClampToEdge,
+    };
+    let sd = MTLSamplerDescriptor::new();
+    sd.setMinFilter(linear(0x10));
+    sd.setMagFilter(linear(0x4));
+    sd.setMipFilter(if aniso || filter & 1 != 0 {
+        MTLSamplerMipFilter::Linear
+    } else {
+        MTLSamplerMipFilter::Nearest
+    });
+    sd.setSAddressMode(mode(u));
+    sd.setTAddressMode(mode(v));
+    sd.setRAddressMode(mode(ww));
+    sd.setMaxAnisotropy(if aniso {
+        anisotropy.clamp(1, 16) as usize
+    } else {
+        1
+    });
+    if filter & 0x80 != 0 {
+        // `D3D12_COMPARISON_FUNC`, 1 (never) to 8 (always).
+        let c = [
+            Compare::Never,
+            Compare::Less,
+            Compare::Equal,
+            Compare::LessEqual,
+            Compare::Greater,
+            Compare::NotEqual,
+            Compare::GreaterEqual,
+            Compare::Always,
+        ];
+        sd.setCompareFunction(compare(c[(comparison.clamp(1, 8) - 1) as usize]));
+    }
+    sd.setBorderColor(match border {
+        1 => MTLSamplerBorderColor::OpaqueBlack,
+        2 => MTLSamplerBorderColor::OpaqueWhite,
+        _ => MTLSamplerBorderColor::TransparentBlack,
+    });
+    let (lo, hi) = (f32::from_bits(min_lod), f32::from_bits(max_lod));
+    let lo = if lo.is_nan() { 0.0 } else { lo.max(0.0) };
+    sd.setLodMinClamp(lo);
+    sd.setLodMaxClamp(if hi.is_nan() { f32::MAX } else { hi.max(lo) });
+    // The table holds the sampler's resource ID, which exists only for argument-buffer samplers.
+    sd.setSupportArgumentBuffers(true);
+    dev.newSamplerStateWithDescriptor(&sd)
+        .ok_or_else(|| "newSamplerState failed for a static sampler".into())
 }
 
 fn vertex_format(f: VertexFormat) -> MTLVertexFormat {
@@ -488,12 +601,69 @@ impl Metal {
         heap.refs.borrow().values().for_each(|r| use_res(r));
     }
 
+    /// The static samplers of one stage's `layout`, if it declares any.
+    pub(crate) fn static_samplers(
+        &self,
+        layout: Option<&victory_backend::backend::RootLayout>,
+    ) -> Result<Option<StaticSamplers>, String> {
+        let Some(l) = layout.filter(|l| !l.static_samplers.is_empty()) else {
+            return Ok(None);
+        };
+        // The converter's layout names the table as a table resource with no register.
+        // With no table in the layout there is nothing to fill: the pipeline is still made.
+        let Some(offset) = self
+            .msc()?
+            .locations(l)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .find(|&&(kind, space, slot, ..)| kind == 0 && space == u32::MAX && slot == u32::MAX)
+            .map(|&(.., offset, _)| offset as usize)
+        else {
+            return Ok(None);
+        };
+        let table = self
+            .dev
+            .newBufferWithLength_options(
+                l.static_samplers.len() * ENTRY,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or("no static sampler table")?;
+        let mut samplers = Vec::new();
+        for (n, w) in l.static_samplers.iter().enumerate() {
+            let s = static_sampler(&self.dev, w)?;
+            let bias = f32::from_bits(w[4]);
+            let bias = if bias.is_nan() {
+                0.0
+            } else {
+                bias.clamp(-16.0, 15.99)
+            };
+            let entry = [resource_id(s.gpuResourceID()), 0, u64::from(bias.to_bits())];
+            // SAFETY: entry `n` is inside the table, which no GPU work reads yet.
+            unsafe {
+                let p = table.contents().as_ptr().cast::<u64>().add(n * ENTRY / 8);
+                entry
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, w)| p.add(i).write(*w));
+            }
+            samplers.push(s);
+        }
+        Ok(Some(StaticSamplers {
+            table,
+            offset,
+            _samplers: samplers,
+        }))
+    }
+
     fn stage_function(
         &self,
         dxil: &[u8],
         layout: Option<&victory_backend::backend::RootLayout>,
     ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
-        let (_, lib) = self.msc.convert_with(dxil, None, layout).map_err(|e| e.to_string())?;
+        let (_, lib) = self
+            .msc()?
+            .convert_with(dxil, None, layout)
+            .map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
         let name = l
             .functionNames()
@@ -509,16 +679,21 @@ impl Metal {
         e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
+        statics: Option<&StaticSamplers>,
     ) {
-        if !root.0.is_empty() {
+        let root = StaticSamplers::args(statics, &root.0);
+        if !root.is_empty() {
             // SAFETY: setBytes copies `root` (at most 4 KiB) before returning.
             unsafe {
                 e.setBytes_length_atIndex(
-                    NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap(),
-                    root.0.len(),
+                    NonNull::new(root.as_ptr().cast_mut().cast()).unwrap(),
+                    root.len(),
                     ARGUMENT_BUFFER,
                 )
             };
+        }
+        if let Some(t) = StaticSamplers::table(statics) {
+            e.useResource_usage(t, MTLResourceUsage::Read);
         }
         for (h, slot) in [
             (heaps.resource, HEAP_SLOT[0]),
@@ -540,17 +715,31 @@ impl Metal {
         root: &RootArgs,
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
+        pipeline: &RenderPipeline,
     ) {
         let fragment = fragment.unwrap_or(root);
+        let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
+        let (root, fragment) = (
+            StaticSamplers::args(vs, &root.0),
+            StaticSamplers::args(ps, &fragment.0),
+        );
         // SAFETY: setBytes copies the bytes before returning.
         unsafe {
-            if !root.0.is_empty() {
-                let p = NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap();
-                e.setVertexBytes_length_atIndex(p, root.0.len(), ARGUMENT_BUFFER);
+            if !root.is_empty() {
+                let p = NonNull::new(root.as_ptr().cast_mut().cast()).unwrap();
+                e.setVertexBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
             }
-            if !fragment.0.is_empty() {
-                let p = NonNull::new(fragment.0.as_ptr().cast_mut().cast()).unwrap();
-                e.setFragmentBytes_length_atIndex(p, fragment.0.len(), ARGUMENT_BUFFER);
+            if !fragment.is_empty() {
+                let p = NonNull::new(fragment.as_ptr().cast_mut().cast()).unwrap();
+                e.setFragmentBytes_length_atIndex(p, fragment.len(), ARGUMENT_BUFFER);
+            }
+        }
+        for (t, stage) in [
+            (vs, MTLRenderStages::Vertex),
+            (ps, MTLRenderStages::Fragment),
+        ] {
+            if let Some(t) = StaticSamplers::table(t) {
+                e.useResource_usage_stages(t, MTLResourceUsage::Read, stage);
             }
         }
         for (h, slot) in [
@@ -915,10 +1104,13 @@ impl GraphicsBackend for Metal {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
         }
-        let pso = self
-            .dev
-            .newRenderPipelineStateWithDescriptor_error(&pd)
-            .map_err(|e| e.localizedDescription().to_string())?;
+        let pso = match self.archive() {
+            Some(a) => a.render(&self.dev, &pd)?,
+            None => self
+                .dev
+                .newRenderPipelineStateWithDescriptor_error(&pd)
+                .map_err(|e| e.localizedDescription().to_string())?,
+        };
         let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
             let (write, cmp) = d.depth_test.unwrap_or((false, Compare::Always));
@@ -943,12 +1135,43 @@ impl GraphicsBackend for Metal {
             cull,
             raster: d.raster,
             stencil: has_stencil,
+            vs_static: self.static_samplers(d.vs_layout)?,
+            ps_static: if d.ps.is_some() {
+                self.static_samplers(d.ps_layout)?
+            } else {
+                None
+            },
         })
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
-        let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
-        let _ = take_ops();
+        if self.trace_fails {
+            report_in_flight();
+            self.trace_enc.borrow_mut().clear();
+        }
+        let cb = if self.trace_fails {
+            let d = MTLCommandBufferDescriptor::new();
+            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+            queue.0.commandBufferWithDescriptor(&d)
+        } else {
+            queue.0.commandBuffer()
+        }
+        .ok_or("no command buffer")?;
+        let mut serial = 0;
+        let mut label = String::new();
+        if self.trace_fails {
+            serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            label = format!(
+                "q{:x} #{} t={:.3} waits={} signals={} passes={}",
+                Retained::as_ptr(&queue.0) as *const u8 as usize,
+                serial,
+                crate::metal::since_start(),
+                work.waits.len(),
+                work.signals.len(),
+                work.passes.len()
+            );
+            cb.setLabel(Some(&objc2_foundation::NSString::from_str(&label)));
+        }
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
@@ -960,7 +1183,7 @@ impl GraphicsBackend for Metal {
             let n = queue.3.get();
             queue.3.set(n + 1);
             if n > 0 {
-                cb.encodeWaitForEvent_value(&queue.2, n);
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*queue.2), n);
             }
             Order {
                 fence: self.dev.newFence(),
@@ -989,69 +1212,46 @@ impl GraphicsBackend for Metal {
             }
         }
         if set_on_queue {
-            cb.encodeSignalEvent_value(&queue.2, queue.3.get());
+            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*queue.2), queue.3.get());
         }
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        // A command buffer the GPU fails is logged (the first few), not silently dropped. One that
-        // took long is logged too: a fence wait of seconds is either this or a submission that
-        // never reached the GPU, and the two need different fixes.
-        let queued = std::time::Instant::now();
-        let ops = take_ops();
-        arm_watchdog();
-        let id = NEXT_CB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((id, queued, ops.clone()));
+        let owed = Owed::new(queue, work, set_on_queue);
+        // A command buffer the GPU fails is logged (the first few), not silently dropped.
+        let trace = self.trace_fails;
+        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        if let Some((s, l, enc)) = &tinfo {
+            IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
+        }
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
-            let ms = queued.elapsed().as_millis();
-            {
-                let mut slot = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-                if slot.as_ref().is_some_and(|(i, _, _)| *i == id) {
-                    *slot = None;
+            if let Some((s, l, enc)) = &tinfo {
+                let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
+                if done.error().is_none()
+                    && let Some(t) = started
+                    && t.elapsed().as_secs_f64() > 1.0
+                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                {
+                    tracing::warn!(
+                        "metal: slow command buffer {l} took {:.3}s (gpu {:.3}s, kernel {:.3}s) | {enc}",
+                        t.elapsed().as_secs_f64(),
+                        done.GPUEndTime() - done.GPUStartTime(),
+                        done.kernelEndTime() - done.kernelStartTime()
+                    );
                 }
             }
-            if ms >= 500 || done.error().is_some() {
-                // The biggest dispatches first: the one that ran long is among them.
-                let mut largest: Vec<(usize, [usize; 3], [usize; 3])> = ops
-                    .iter()
-                    .filter_map(|op| match op {
-                        Op::Compute { groups, threads } => Some((
-                            groups[0] * groups[1] * groups[2] * threads[0] * threads[1] * threads[2],
-                            *groups,
-                            *threads,
-                        )),
-                        Op::Render { .. } => None,
-                    })
-                    .collect();
-                largest.sort_by_key(|e| std::cmp::Reverse(e.0));
-                let top: Vec<String> = largest
-                    .iter()
-                    .take(6)
-                    .map(|(n, g, t)| format!("{n} invocations g={g:?} t={t:?}"))
-                    .collect();
-                let render: Vec<String> = ops
-                    .iter()
-                    .filter_map(|op| match op {
-                        Op::Render { draws, w, h, geometry } => {
-                            Some(format!("{draws} draws {w}x{h} {geometry} primitives"))
-                        }
-                        Op::Compute { .. } => None,
-                    })
-                    .collect();
-                eprintln!(
-                    "metal: command buffer {ms} ms, {} dispatches, largest {top:?}, {} render passes {render:?}",
-                    ops.iter().filter(|o| matches!(o, Op::Compute { .. })).count(),
-                    render.len()
-                );
-            }
-            if let Some(e) = done.error()
-                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
-            {
-                eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+            if let Some(e) = done.error() {
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 } {
+                    if trace {
+                        trace_failure(done, &e);
+                    } else {
+                        eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                    }
+                }
+                owed.recover();
             }
         });
         // SAFETY: the block is retained by Metal until it has run.
@@ -1064,7 +1264,143 @@ impl GraphicsBackend for Metal {
     }
 }
 
+/// What a submission owes the title once it completes: the order event, the title's fence signals
+/// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and
+/// every fence and barrier word waiting on it would hang; `recover` pays them from the CPU.
+///
+/// Not `Send`: the completed-handler block is only `Fn`, and Metal's objects are thread-safe to use
+/// this way. The fills write title memory the pool keeps mapped while the buffer lives (`buf` is
+/// held here to keep the wrapper alive).
+pub(crate) struct Owed {
+    events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+    /// Buffer, offset, length, byte.
+    #[allow(clippy::type_complexity)]
+    fills: Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>,
+    signals: usize,
+}
+
+impl Owed {
+    pub(crate) fn new(queue: &Queue, work: &PassSubmission<'_, Metal>, set_on_queue: bool) -> Owed {
+        let mut events = Vec::with_capacity(work.signals.len() + 1);
+        if set_on_queue {
+            events.push((queue.2.clone(), queue.3.get()));
+        }
+        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        let mut fills = Vec::new();
+        for pass in work.passes {
+            if let Pass::Blit(ops) = pass {
+                for op in ops {
+                    // shortcut: copies are not replayed (one may have partly run and its source
+                    // may have changed since), when a title needs a failed copy's data upgrade
+                    // to a replay that checks the source is unchanged.
+                    if let BlitOp::Fill { dst, len, value } = op {
+                        fills.push((dst.0.buf.clone(), dst.1 as usize - dst.0.base as usize, *len, *value));
+                    }
+                }
+            }
+        }
+        Owed { events, fills, signals: work.signals.len() }
+    }
+
+    /// Raises each event (never lowers it) and writes each fill, in order.
+    pub(crate) fn recover(&self) {
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        for (e, v) in &self.events {
+            if e.signaledValue() < *v {
+                e.setSignaledValue(*v);
+            }
+        }
+        for (buf, off, len, value) in &self.fills {
+            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
+        }
+        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            tracing::warn!(
+                "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                self.signals,
+                self.fills.len()
+            );
+        }
+    }
+}
+
+static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
+static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static REPORTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Slow and in-flight lines printed so far (each capped at 100).
+static TRACE_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FLIGHT_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Logs each command buffer in flight for over 3 s, once (the locks are not held while logging).
+fn report_in_flight() {
+    let old: Vec<(u64, f64, String)> = IN_FLIGHT
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, (t, _))| t.elapsed().as_secs_f64() > 3.0)
+        .map(|(s, (t, d))| (*s, t.elapsed().as_secs_f64(), d.clone()))
+        .collect();
+    for (s, secs, d) in old {
+        if REPORTED.lock().unwrap().insert(s)
+            && FLIGHT_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+        {
+            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}");
+        }
+    }
+}
+
+/// One `tracing::warn!` line for a failed command buffer: its label and each encoder's state.
+fn trace_failure(cb: &ProtocolObject<dyn MTLCommandBuffer>, e: &objc2_foundation::NSError) {
+    let label = cb.label().map(|l| l.to_string()).unwrap_or_default();
+    let mut encoders = String::new();
+    // SAFETY: the key is a Metal constant; the value is an NSArray of encoder infos.
+    let infos = e.userInfo().objectForKey(unsafe { MTLCommandBufferEncoderInfoErrorKey });
+    if let Some(infos) = infos {
+        // SAFETY: Metal documents the value as an array of `MTLCommandBufferEncoderInfo`.
+        let infos: Retained<objc2_foundation::NSArray<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>> =
+            unsafe { Retained::cast_unchecked(infos) };
+        for i in infos.iter() {
+            let st = match i.errorState() {
+                MTLCommandEncoderErrorState::Completed => "Completed",
+                MTLCommandEncoderErrorState::Pending => "Pending",
+                MTLCommandEncoderErrorState::Faulted => "Faulted",
+                MTLCommandEncoderErrorState::Affected => "Affected",
+                _ => "Unknown",
+            };
+            encoders.push_str(&format!(" | [{st}] {}", i.label()));
+        }
+    }
+    tracing::warn!(
+        "metal: command buffer failed: [{label}] now={:.3} ({}){encoders}",
+        crate::metal::since_start(),
+        e.localizedDescription()
+    );
+}
+
+/// Caps an encoder label.
+fn cap_label_str(mut s: String) -> String {
+    if s.len() > 600 {
+        let mut n = 600;
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        s.truncate(n);
+    }
+    s
+}
+
 impl Metal {
+    /// The capped label for an encoder, kept for the command buffer's description.
+    fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
+        let s = cap_label_str(s);
+        let n = objc2_foundation::NSString::from_str(&s);
+        self.trace_enc.borrow_mut().push(s);
+        n
+    }
+
     fn encode_blit(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -1149,12 +1485,102 @@ impl Metal {
             e.updateFence(f);
             started.set(true);
         }
+        if self.trace_fails {
+            let fills = ops.iter().filter(|o| matches!(o, BlitOp::Fill { .. })).count();
+            e.setLabel(Some(&self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len()))));
+        }
         e.endEncoding();
         Ok(())
     }
 }
 
+/// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
+/// on the GPU: this one-thread kernel copies the record's `words`, or zeros (no groups, no
+/// vertices or instances), into a buffer of its own, which the indirect command then reads.
+/// Bound at 20 and up, apart from the converter's slots.
+const GATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void gate(device const uint *count [[buffer(20)]],
+                 device const uint *record [[buffer(21)]],
+                 device uint *out [[buffer(22)]],
+                 constant uint2 &at [[buffer(23)]]) {
+    bool run = at.x < count[0];
+    for (uint w = 0; w < at.y; w++) {
+        out[w] = run ? record[w] : 0u;
+    }
+}
+"#;
+
 impl Metal {
+    fn gate_pipeline(&self) -> Result<&ProtocolObject<dyn MTLComputePipelineState>, String> {
+        self.gate
+            .get_or_init(|| {
+                let lib = self
+                    .dev
+                    .newLibraryWithSource_options_error(
+                        &objc2_foundation::NSString::from_str(GATE),
+                        None,
+                    )
+                    .map_err(|e| e.localizedDescription().to_string())?;
+                let f = lib
+                    .newFunctionWithName(&objc2_foundation::NSString::from_str("gate"))
+                    .ok_or("no gate function")?;
+                self.dev
+                    .newComputePipelineStateWithFunction_error(&f)
+                    .map_err(|e| e.localizedDescription().to_string())
+            })
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    /// Encodes the gate of one counted record (`words` long at `record`) into `e`; returns the
+    /// buffer the indirect command reads instead of the record. Tracked by Metal (unlike the
+    /// title's pools), so whatever reads it later in the command buffer waits for the write.
+    /// shortcut: one gate dispatch and one small buffer per record; gate all the records of one
+    /// `ExecuteIndirect` in a single dispatch if a large `MaxCommandCount` shows up in profiles.
+    fn encode_gate(
+        &self,
+        e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        (count, at, index): (&Buffer, *const u8, u32),
+        (record, title): (&Buffer, *const u8),
+        words: u32,
+        set_on_queue: bool,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
+        let out = self
+            .dev
+            .newBufferWithLength_options(words as usize * 4, MTLResourceOptions::StorageModePrivate)
+            .ok_or("no buffer for a gated indirect record")?;
+        for b in [count, record] {
+            if self.names(b, set_on_queue) {
+                e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+            }
+        }
+        // What the work before wrote (the count, the record) is seen.
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        e.setComputePipelineState(self.gate_pipeline()?);
+        let args = [index, words];
+        // SAFETY: both title ranges lie inside live buffers (the caller resolved them); the bytes
+        // are copied before the call returns.
+        unsafe {
+            e.setBuffer_offset_atIndex(Some(&count.buf), at as usize - count.base as usize, 20);
+            e.setBuffer_offset_atIndex(
+                Some(&record.buf),
+                title as usize - record.base as usize,
+                21,
+            );
+            e.setBuffer_offset_atIndex(Some(&out), 0, 22);
+            e.setBytes_length_atIndex(
+                NonNull::new(args.as_ptr().cast_mut().cast()).unwrap(),
+                8,
+                23,
+            );
+        }
+        e.dispatchThreadgroups_threadsPerThreadgroup(size([1, 1, 1]), size([1, 1, 1]));
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        Ok(out)
+    }
+
     /// Whether encoder `use` calls are needed for `b`: not when the queue has the pool residency set
     /// and the buffer is in it.
     fn names(&self, b: &Buffer, set_on_queue: bool) -> bool {
@@ -1182,26 +1608,61 @@ impl Metal {
             e.waitForFence(f);
         }
         for d in dispatches {
+            let gated = match (d.count, d.indirect) {
+                (Some(count), Some(record)) => {
+                    Some(self.encode_gate(&e, count, record, 3, set_on_queue)?)
+                }
+                _ => None,
+            };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps);
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            note_op(Op::Compute {
-                groups: d.groups,
-                threads: d.threads_per_group,
-            });
-            e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
+            match d.indirect {
+                Some((b, title)) => {
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                    }
+                    let (buf, at) = match &gated {
+                        Some(g) => (&**g, 0),
+                        None => (&*b.buf, title as usize - b.base as usize),
+                    };
+                    // SAFETY: the caller resolved three words at `title` inside the live buffer
+                    // (or the gate wrote them to its own).
+                    unsafe {
+                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            buf,
+                            at,
+                            size(d.threads_per_group),
+                        )
+                    };
+                }
+                None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
             started.set(true);
+        }
+        if self.trace_fails {
+            let names = self.pipe_names.borrow();
+            let mut l = String::from("compute: ");
+            for d in dispatches {
+                let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
+                match names.get(&k) {
+                    Some(n) => l.push_str(n),
+                    None => l.push_str(&format!("{k:#x}")),
+                }
+                l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+            }
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())
@@ -1266,6 +1727,38 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
+        // Counted indirect draws are gated first, in a compute pass of their own.
+        let mut gates = Vec::new();
+        if rp
+            .draws
+            .iter()
+            .any(|d| d.count.is_some() && d.indirect.is_some())
+        {
+            let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
+            if let Some((f, started)) = order
+                && started.get()
+            {
+                c.waitForFence(f);
+            }
+            for d in &rp.draws {
+                let words = if matches!(d.call, DrawCall::Indexed { .. }) {
+                    5
+                } else {
+                    4
+                };
+                gates.push(match (d.count, d.indirect) {
+                    (Some(count), Some(record)) => {
+                        Some(self.encode_gate(&c, count, record, words, set_on_queue)?)
+                    }
+                    _ => None,
+                });
+            }
+            if let Some((f, started)) = order {
+                c.updateFence(f);
+                started.set(true);
+            }
+            c.endEncoding();
+        }
         if let Some(dp) = &rp.depth {
             let a = desc.depthAttachment();
             a.setTexture(Some(&dp.texture.tex));
@@ -1316,28 +1809,7 @@ impl Metal {
             .map(|c| &c.texture.tex)
             .or(rp.depth.as_ref().map(|d| &d.texture.tex))
             .map_or((0, 0), |t| (t.width(), t.height()));
-        note_op(Op::Render {
-            draws: rp.draws.len(),
-            w: rt_size.0 as u32,
-            h: rt_size.1 as u32,
-            geometry: rp
-                .draws
-                .iter()
-                .map(|d| match d.call {
-                    victory_backend::resources::DrawCall::Arrays {
-                        vertex_count,
-                        instance_count,
-                        ..
-                    } => u64::from(vertex_count) * u64::from(instance_count.max(1)),
-                    victory_backend::resources::DrawCall::Indexed {
-                        index_count,
-                        instance_count,
-                        ..
-                    } => u64::from(index_count) * u64::from(instance_count.max(1)),
-                })
-                .sum(),
-        });
-        for d in &rp.draws {
+        for (k, d) in rp.draws.iter().enumerate() {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
@@ -1403,7 +1875,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
@@ -1435,6 +1907,55 @@ impl Metal {
             // What `IRRuntimeDrawPrimitives` / `IRRuntimeDrawIndexedPrimitives` do: draw arguments
             // (`IRRuntimeDrawParams`, 5 words) at slot 4 and the index type at slot 5 (0 = not indexed,
             // else Metal's index type + 1), then the draw itself.
+            if let Some((ab, title)) = d.indirect {
+                // What the converter runtime's indirect `IRRuntimeDraw(Indexed)Primitives` do: the
+                // argument record itself is the shader's draw arguments (D3D12's records are
+                // `IRRuntimeDraw(Indexed)Argument`s and Metal's indirect ones, word for word).
+                if self.names(ab, set_on_queue) {
+                    e.useResource_usage_stages(
+                        ProtocolObject::from_ref(&*ab.buf),
+                        MTLResourceUsage::Read,
+                        MTLRenderStages::Vertex,
+                    );
+                }
+                // A counted record is read from its gate's buffer.
+                let (args, at) = match gates.get(k).and_then(Option::as_ref) {
+                    Some(g) => (&**g, 0),
+                    None => (&*ab.buf, title as usize - ab.base as usize),
+                };
+                // SAFETY: the record is inside the live buffer (the caller resolved it).
+                unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
+                match (d.call, d.index_buffer) {
+                    (DrawCall::Arrays { .. }, _) => {
+                        set_index_type(&e, 0);
+                        // SAFETY: as above.
+                        unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at) };
+                    }
+                    (DrawCall::Indexed { wide, .. }, Some((b, title))) => {
+                        set_index_type(&e, if wide { 2 } else { 1 });
+                        if self.names(b, set_on_queue) {
+                            e.useResource_usage_stages(
+                                ProtocolObject::from_ref(&*b.buf),
+                                MTLResourceUsage::Read,
+                                MTLRenderStages::Vertex,
+                            );
+                        }
+                        // SAFETY: both buffers are live; the record's start index counts from `title`.
+                        unsafe {
+                            e.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                                prim,
+                                if wide { MTLIndexType::UInt32 } else { MTLIndexType::UInt16 },
+                                &b.buf,
+                                title as usize - b.base as usize,
+                                args,
+                                at,
+                            )
+                        };
+                    }
+                    (DrawCall::Indexed { .. }, None) => return Err("indexed draw without an index buffer".into()),
+                }
+                continue;
+            }
             let mut dp = [0u32; 5];
             let ib: u16;
             match d.call {
@@ -1519,6 +2040,9 @@ impl Metal {
             e.updateFence_afterStages(f, MTLRenderStages::Fragment);
             started.set(true);
         }
+        if self.trace_fails {
+            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+        }
         e.endEncoding();
         Ok(())
     }
@@ -1532,6 +2056,14 @@ fn set_draw_bytes(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, dp: &[u32; 5]
             20,
             DRAW_ARGUMENTS,
         );
+    }
+    set_index_type(e, index_type);
+}
+
+/// The converter's index type word (0 = not indexed, else Metal's index type + 1).
+fn set_index_type(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, index_type: u16) {
+    // SAFETY: setVertexBytes copies the bytes before returning.
+    unsafe {
         e.setVertexBytes_length_atIndex(
             NonNull::new((&raw const index_type).cast_mut().cast()).unwrap(),
             2,
@@ -1550,4 +2082,46 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use super::*;
+    use crate::backend::ComputeBackend;
+    use crate::mem::{Region, page_size};
+
+    #[test]
+    fn a_failed_command_buffer_is_paid_on_the_cpu() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) };
+        let q = m.create_queue().unwrap();
+        q.1.set(true); // as with the pool's residency set: the order event is in play
+        let fence = m.create_fence(0).unwrap();
+        let passes = [Pass::Blit(vec![
+            BlitOp::Fill { dst: (&buf, at(64) as *const u8), len: 8, value: 0xAB },
+            BlitOp::Copy { src: (&buf, at(0) as *const u8), dst: (&buf, at(256) as *const u8), len: 16 },
+        ])];
+        let (s5, s7, s9) = ([(&fence, 5)], [(&fence, 7)], [(&fence, 9)]);
+        let sub = |signals| PassSubmission { waits: &[], passes: &passes, signals };
+        // The recovery a submission signalling the fence to 7 would owe, built as `submit_passes` does.
+        q.3.set(3);
+        let owed = Owed::new(&q, &sub(&s7), true);
+        owed.recover();
+        // SAFETY: bounds as above.
+        let bytes = unsafe { std::slice::from_raw_parts(at(60), 16) };
+        assert_eq!(bytes, [0, 0, 0, 0, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0, 0, 0, 0]);
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { *at(256) }, 0, "copies are not replayed");
+        assert_eq!(m.completed(&fence), 7);
+        assert_eq!(q.2.signaledValue(), 3);
+        // An older submission failing later does not lower anything.
+        Owed::new(&q, &sub(&s5), false).recover();
+        assert_eq!(m.completed(&fence), 7);
+        // A normal submission after it still completes: the queue is not stuck behind the order value.
+        m.submit_passes(&q, &sub(&s9)).unwrap();
+        assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
 }
