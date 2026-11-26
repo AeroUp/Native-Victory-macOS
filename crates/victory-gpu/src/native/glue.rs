@@ -973,7 +973,12 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     if tracing_targets() {
         tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
     }
+    let started = std::time::Instant::now();
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
+    let ms = started.elapsed().as_millis();
+    if ms >= 200 {
+        tracing::info!(ms, name = %g.name, "a guessed pipeline took its time");
+    }
     g.made.borrow_mut().insert(key, made.clone());
     made
 }
