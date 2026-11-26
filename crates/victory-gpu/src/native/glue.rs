@@ -146,6 +146,10 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             let list = crate::list::native(l);
             segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
+        if std::env::var_os("VICTORY_TRACE_HOLD").is_some() {
+            let ptrs: Vec<String> = lists.iter().map(|l| format!("{l:p}")).collect();
+            tracing::info!(queue = format_args!("{queue:p}"), pointers = ?ptrs, "a submission");
+        }
         t.submit(queue as usize, segments);
     });
     let ms = started.elapsed().as_millis();
@@ -1189,7 +1193,7 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if std::env::var_os("VICTORY_TRACE_HOLD").is_some() {
-        tracing::info!(at = format_args!("{address:#x}"), value, bytes, "a bottom-of-pipe value write");
+        tracing::info!(list = format_args!("{this:p}"), at = format_args!("{address:#x}"), value, bytes, "a bottom-of-pipe value write");
     }
     if std::env::var_os("VICTORY_TRACE_WRITES").is_some() {
         let inside = pools().resolve(address, bytes as u64).is_some();
