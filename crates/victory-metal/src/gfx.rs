@@ -93,6 +93,29 @@ impl Texture {
     }
 }
 
+/// What one command buffer was asked to run. A command buffer that takes seconds is either one
+/// huge dispatch or a shader that runs long, and the counts say which (Metal times out at ~5 s).
+#[derive(Clone, Copy)]
+enum Op {
+    Compute { groups: [usize; 3], threads: [usize; 3] },
+}
+
+static OPS: std::sync::Mutex<Vec<Op>> = std::sync::Mutex::new(Vec::new());
+
+fn note_op(op: Op) {
+    if let Ok(mut v) = OPS.lock()
+        && v.len() < 8192
+    {
+        v.push(op);
+    }
+}
+
+fn take_ops() -> Vec<Op> {
+    OPS.lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
 pub struct Sampler(Retained<ProtocolObject<dyn MTLSamplerState>>);
 
 pub struct RenderPipeline {
@@ -850,6 +873,7 @@ impl GraphicsBackend for Metal {
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+        let _ = take_ops();
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
@@ -886,13 +910,34 @@ impl GraphicsBackend for Metal {
         // took long is logged too: a fence wait of seconds is either this or a submission that
         // never reached the GPU, and the two need different fixes.
         let queued = std::time::Instant::now();
+        let ops = take_ops();
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
             let ms = queued.elapsed().as_millis();
-            if ms >= 500 {
-                eprintln!("metal: command buffer took {ms} ms");
+            if ms >= 500 || done.error().is_some() {
+                // The biggest dispatches first: the one that ran long is among them.
+                let mut largest: Vec<(usize, [usize; 3], [usize; 3])> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Compute { groups, threads } => Some((
+                            groups[0] * groups[1] * groups[2] * threads[0] * threads[1] * threads[2],
+                            *groups,
+                            *threads,
+                        )),
+                    })
+                    .collect();
+                largest.sort_by_key(|e| std::cmp::Reverse(e.0));
+                let top: Vec<String> = largest
+                    .iter()
+                    .take(6)
+                    .map(|(n, g, t)| format!("{n} invocations g={g:?} t={t:?}"))
+                    .collect();
+                eprintln!(
+                    "metal: command buffer {ms} ms, {} dispatches, largest {top:?}",
+                    ops.len()
+                );
             }
             if let Some(e) = done.error()
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
@@ -989,6 +1034,10 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
+            note_op(Op::Compute {
+                groups: d.groups,
+                threads: d.threads_per_group,
+            });
             e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
         }
         if let Some((f, started)) = order {
