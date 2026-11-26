@@ -198,6 +198,12 @@ pub struct Title<B: PresentBackend> {
     pub(super) surface: Option<B::Surface>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
+    /// The small textures title textures without content are bound to, one per format and shape.
+    pub(super) placeholders: Vec<(
+        victory_backend::resources::Format,
+        victory_backend::resources::TexDim,
+        Rc<B::Texture>,
+    )>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
@@ -224,6 +230,7 @@ impl<B: PresentBackend> Title<B> {
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
+            placeholders: Vec::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),

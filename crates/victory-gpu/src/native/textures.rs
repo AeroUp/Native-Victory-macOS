@@ -33,6 +33,8 @@ pub static UNMAPPED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Textures whose memory was entirely zero at their first upload (content not streamed in yet).
 pub static BLANK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BLANK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Textures bound to a placeholder because their content had not arrived (VICTORY_TEXTURE_LAZY).
+pub static LAZY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `D3D12_RESOURCE_FLAGS`.
 const RENDER_TARGET: u32 = 1;
@@ -200,6 +202,10 @@ fn start_scanner() {
 pub struct Tracked<B: ResourceBackend> {
     pub texture: Rc<B::Texture>,
     info: TextureInfo,
+    /// What the host texture costs; 0 while its content has not arrived (a shared placeholder).
+    bytes: u64,
+    /// Bound to the shared placeholder, not a texture of its own.
+    blank: bool,
     /// The hash of the memory last uploaded; `None` for targets and before the first upload.
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
@@ -314,7 +320,8 @@ impl<B: PresentBackend> Title<B> {
             return false;
         }
         self.pending.remove(&key);
-        PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);        let Some(desc) = info.desc() else {
+        PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(desc) = info.desc() else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -324,13 +331,28 @@ impl<B: PresentBackend> Title<B> {
             }
             return false;
         };
-        let tex = match self.host.texture(&desc) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, ?desc, "no host texture");
-                return false;
+        // A world load realizes thousands of textures whose content has not been streamed in yet
+        // (all zeros in title memory). A full-size host texture of zeros costs the same as content
+        // and shows the same (black), so with VICTORY_TEXTURE_LAZY they start on one small
+        // placeholder per format and shape, and get their own texture when content arrives.
+        let lazy = !desc.render_target && std::env::var_os("VICTORY_TEXTURE_LAZY").is_some();
+        let (tex, blank) = if lazy {
+            match self.placeholder_for(&desc) {
+                Some(p) => (p, true),
+                None => return false,
+            }
+        } else {
+            match self.host.texture(&desc) {
+                Ok(t) => (t, false),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?desc, "no host texture");
+                    return false;
+                }
             }
         };
+        if blank {
+            LAZY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // (The unmapped check above ran before the texture was made: an unmapped title texture
         // never gets here, so there is no second copy to drop.)
         self.host.register_texture(key, &tex);
@@ -368,9 +390,11 @@ impl<B: PresentBackend> Title<B> {
                 );
             }
         }
-        let bytes = info.size as u64;
-        TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        TEXTURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = if blank { 0 } else { info.size as u64 };
+        if bytes > 0 {
+            TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            TEXTURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if info.render_target() {
             TARGET_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -379,6 +403,8 @@ impl<B: PresentBackend> Title<B> {
             Tracked {
                 texture: tex,
                 info,
+                bytes,
+                blank,
                 last: None,
                 uploads: 0,
                 hot: 0,
@@ -386,6 +412,33 @@ impl<B: PresentBackend> Title<B> {
             },
         );
         true
+    }
+
+    /// The 1-texel (1 block for compressed formats) texture a title texture without content is
+    /// bound to: one per format and shape, so a view of it has the shape the title's view asks
+    /// for and Metal accepts the view.
+    fn placeholder_for(&mut self, desc: &TextureDesc) -> Option<Rc<B::Texture>> {
+        if let Some((_, _, t)) = self
+            .placeholders
+            .iter()
+            .find(|(f, d, _)| *f == desc.format && *d == desc.dim)
+        {
+            return Some(t.clone());
+        }
+        let block = desc.format.block().0 as usize;
+        let small = TextureDesc {
+            dim: desc.dim,
+            format: desc.format,
+            width: block,
+            height: block,
+            depth_or_layers: 1,
+            mips: 1,
+            render_target: false,
+            unordered_access: false,
+        };
+        let t = self.host.texture(&small).ok()?;
+        self.placeholders.push((desc.format, desc.dim, t.clone()));
+        Some(t)
     }
 
     /// The format of the host texture of title texture `key`.
@@ -406,11 +459,12 @@ impl<B: PresentBackend> Title<B> {
 
     pub fn texture_released(&mut self, key: usize) {
         if let Some(t) = self.textures.remove(&key) {
-            let bytes = t.info.size as u64;
-            TEXTURE_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-            TEXTURE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if t.bytes > 0 {
+                TEXTURE_BYTES.fetch_sub(t.bytes, std::sync::atomic::Ordering::Relaxed);
+                TEXTURE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if t.info.render_target() {
-                TARGET_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                TARGET_BYTES.fetch_sub(t.bytes, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if self.pending.remove(&key).is_some() {
@@ -527,6 +581,36 @@ impl<B: PresentBackend> Title<B> {
             if blank && t.uploads == 0 {
                 BLANK_BYTES.fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
                 BLANK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if t.blank {
+                // Still blank: the placeholder already samples what the memory holds (zeros).
+                if !blank {
+                    // Content arrived: its own texture, and every heap entry that names the key
+                    // points at it from now on.
+                    let Some(desc) = t.info.desc() else {
+                        t.last = Some(hash);
+                        continue;
+                    };
+                    match host.texture(&desc) {
+                        Ok(real) => {
+                            t.texture = real.clone();
+                            t.blank = false;
+                            t.bytes = t.info.size as u64;
+                            TEXTURE_BYTES.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
+                            TEXTURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            host.register_texture(*key, &real);
+                            host.rewrite_key(*key);
+                        }
+                        Err(e) => {
+                            tracing::warn!(texture = *key, error = %e, "no host texture for content that arrived");
+                            t.last = Some(hash);
+                            continue;
+                        }
+                    }
+                } else {
+                    t.last = Some(hash);
+                    continue;
+                }
             }
             // Written again after its first upload, or blank at it (written later): hot.
             if !t.info.render_target() && (t.uploads > 0 || blank) {

@@ -563,6 +563,32 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     // SAFETY: valid for the whole dispatch.
     let information = unsafe { (*rec).information };
     eprintln!("VIctory: unhandled exception {code:#010x} at {place} {information:x?}");
+    // The stack above the fault: return addresses into the game's image, so a crash report can
+    // name the callers without a debugger attached.
+    let rsp = unsafe { (*ctx).gpr[RSP] };
+    let mut seen = std::collections::HashSet::new();
+    let mut callers: Vec<String> = Vec::new();
+    for i in 0..8192u64 {
+        let Some(word) = crate::native::dump::read_checked(rsp.wrapping_add(i * 8) as usize) else {
+            break;
+        };
+        if let Some(base) = unwind::image_base_of(word) {
+            let rva = word as usize - base;
+            if rva > 0x1000 && seen.insert(rva) {
+                // The function that contains it, when the image's unwind tables say.
+                let start = unwind::lookup(word).map_or(0, |(_, f)| {
+                    // SAFETY: `lookup` returned a table entry inside a registered image.
+                    let f = unsafe { &*f };
+                    f.begin as usize
+                });
+                callers.push(format!("image+{rva:#x} in +{start:#x}"));
+                if callers.len() >= 24 {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("VIctory: callers {callers:?}");
     std::process::abort();
 }
 
