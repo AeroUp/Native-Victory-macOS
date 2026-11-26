@@ -231,6 +231,10 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
+///
+/// `VICTORY_DISPLAY_MODE=1920x1080` reports that mode instead. The title sizes the picture it
+/// renders by the display mode it is told about, so on a Mac this is the one lever between a 4K
+/// frame and a 1080p one (four times the GPU work and the target memory).
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -250,9 +254,19 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (width, height) = *SIZE.get_or_init(|| {
+        std::env::var("VICTORY_DISPLAY_MODE")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.split_once(['x', 'X'])?;
+                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            })
+            .unwrap_or((3840, 2160))
+    });
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
