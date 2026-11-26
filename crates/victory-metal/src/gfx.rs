@@ -482,16 +482,6 @@ impl Metal {
         if heap.set.is_some() {
             return;
         }
-        // Once per command buffer (and again if the heap's entries changed): naming every entry
-        // for every draw is O(entries) per draw, which the world's first frames cannot afford.
-        let key = (
-            ProtocolObject::from_ref(&*heap.buf) as *const ProtocolObject<dyn MTLResource>
-                as *const () as usize,
-            heap.refs.borrow().len(),
-        );
-        if !self.named.borrow_mut().insert(key) {
-            return;
-        }
         use_res(ProtocolObject::from_ref(&*heap.buf));
         heap.refs.borrow().values().for_each(|r| use_res(r));
     }
@@ -957,7 +947,6 @@ impl GraphicsBackend for Metal {
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
         let _ = take_ops();
-        self.named.borrow_mut().clear();
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
