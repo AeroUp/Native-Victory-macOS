@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn blocking_present_times_out_when_acquisition_never_returns() {
         let Ok(metal) = Metal::new() else { return };
-        let layer = metal.create_layer(4, 4);
+        let layer = metal.create_layer(4, 4, true);
         let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
         let queue = metal.create_queue().unwrap();
         let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
