@@ -566,7 +566,9 @@ impl<B: PresentBackend> Title<B> {
     pub fn evict_to_budget(&mut self) {
         let Some(budget) = texture_budget() else { return };
         let mut used = TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-        if used <= budget {
+        // A little over is not worth churn: a texture dropped and bound again next frame costs
+        // its whole detile, so eviction waits until the overshoot is worth the work.
+        if used <= budget + (64 << 20) {
             return;
         }
         // Sorting every realized texture is not free: evict at most a few times a second, and the
@@ -582,7 +584,8 @@ impl<B: PresentBackend> Title<B> {
         let mut candidates: Vec<(u64, usize, u64)> = self
             .textures
             .iter()
-            .filter(|(_, t)| !t.info.render_target() && t.bytes > 0 && !t.blank)
+            // Small ones are not worth a re-upload: the streaming set is what grows.
+            .filter(|(_, t)| !t.info.render_target() && t.bytes >= (1 << 20) && !t.blank)
             .map(|(&k, t)| (t.used, k, t.bytes))
             .collect();
         candidates.sort_unstable();
