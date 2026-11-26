@@ -239,6 +239,26 @@ impl<S> Held<S> {
         self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
     }
 
+    /// One line per queue that holds anything: its item kinds, in order, and whether it can move.
+    pub(crate) fn summary(&self) -> Vec<String> {
+        self.queues
+            .iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(q, items)| {
+                let kinds: Vec<String> = items
+                    .iter()
+                    .take(6)
+                    .map(|(i, _, _)| match i {
+                        Item::Segment(_, w) => format!("segment(waits {})", w.len()),
+                        Item::Signal(f, v) => format!("signal {f:#x}={v}"),
+                        Item::FenceWait(f, v) => format!("fencewait {f:#x}>={v}"),
+                    })
+                    .collect();
+                format!("queue {q:#x}: {} items {kinds:?}", items.len())
+            })
+            .collect()
+    }
+
     /// Releases work held longer than `limit` at the heads of blocked
     /// queues, as if its waits held: the count of segments forced.
     // shortcut: a safety valve against waits nothing will satisfy (a write

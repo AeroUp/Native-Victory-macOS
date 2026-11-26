@@ -365,6 +365,10 @@ pub fn run(
                         seconds = last.1.elapsed().as_secs(),
                         "no frame presented: dumping the title's threads"
                     );
+                    tracing::warn!(
+                        fences = ?victory_gpu::native::fences_and_held(),
+                        "no frame presented: fences and held queues"
+                    );
                     victory_loader::native::dump::report_now();
                     last = (frames, Instant::now());
                 }

@@ -415,6 +415,11 @@ pub(crate) fn present(queue: This, resource: This) {
     }
 }
 
+/// Every live fence and what each queue holds, for the stall watchdog.
+pub fn fences_and_held() -> Vec<String> {
+    with_title(|t| t.fences_and_held()).unwrap_or_default()
+}
+
 /// Frames presented to the layer so far.
 pub fn frames_presented() -> u64 {
     with_title(|t| t.surface().map_or(0, |s| s.frames())).unwrap_or(0)

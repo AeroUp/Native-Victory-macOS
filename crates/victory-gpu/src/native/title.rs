@@ -440,6 +440,23 @@ impl<B: PresentBackend> Title<B> {
         waiting.retain(|token, _| held.waits_for(*token));
     }
 
+    /// Every live fence with its completed and requested values, and what each queue holds: a
+    /// stall report that does not need a wait to be older than some limit.
+    pub fn fences_and_held(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .fences
+            .iter()
+            .map(|(k, f)| {
+                let done = self.host.backend.completed(f);
+                let want = self.requested.get(k).map_or(0, |(v, _)| *v);
+                let since = self.requested.get(k).map_or(0.0, |(_, t)| t.elapsed().as_secs_f64());
+                format!("fence {k:#x}: completed {done}, requested {want} ({since:.1}s ago)")
+            })
+            .collect();
+        out.extend(self.held.summary());
+        out
+    }
+
     /// Queues whose head has been held longer than `limit`: a line each, with the waits that do
     /// not hold (address, comparison, reference, mask, current value).
     pub fn stuck(&self, limit: std::time::Duration) -> Vec<String> {
