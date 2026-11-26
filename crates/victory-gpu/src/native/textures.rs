@@ -569,6 +569,16 @@ impl<B: PresentBackend> Title<B> {
         if used <= budget {
             return;
         }
+        // Sorting every realized texture is not free: evict at most a few times a second, and the
+        // streaming set overshoots the budget by no more than what a second of it costs.
+        thread_local! {
+            static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+        }
+        let now = std::time::Instant::now();
+        if LAST.with(|l| l.get().is_some_and(|t| now.duration_since(t).as_millis() < 500)) {
+            return;
+        }
+        LAST.with(|l| l.set(Some(now)));
         let mut candidates: Vec<(u64, usize, u64)> = self
             .textures
             .iter()
