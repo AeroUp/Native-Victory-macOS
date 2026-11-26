@@ -56,7 +56,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
-    buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
+    /// A buffer over each pool, with the base and length it was made for: a pool the title
+    /// released and a new one that took its id must not share the old address.
+    buffers: RefCell<HashMap<usize, (usize, usize, Rc<B::Buffer>)>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     /// For each texture key, the heap entries that name it: what to rewrite if the texture behind
@@ -222,15 +224,21 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok((buf, addr as *const u8))
     }
 
-    /// The buffer over pool `id`, made the first time the GPU needs it.
+    /// The buffer over pool `id`, made the first time the GPU needs it. The pool's base and
+    /// length are part of the entry: the title may release a pool and a new one may take its id,
+    /// and a fill written through the old buffer would land in memory the title no longer maps
+    /// (the waiting queue then reads the new pool, still zero, and the frame deadlocks).
     fn pool_buffer(&self, id: usize, base: usize, len: usize) -> Result<Rc<B::Buffer>, String> {
         let mut buffers = self.buffers.borrow_mut();
-        Ok(match buffers.entry(id) {
-            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-            std::collections::hash_map::Entry::Vacant(e) => e
-                .insert(Rc::new(self.backend.wrap_title_memory(base as *mut u8, len)?))
-                .clone(),
-        })
+        if let Some((b, l, buf)) = buffers.get(&id)
+            && *b == base
+            && *l == len
+        {
+            return Ok(buf.clone());
+        }
+        let buf = Rc::new(self.backend.wrap_title_memory(base as *mut u8, len)?);
+        buffers.insert(id, (base, len, buf.clone()));
+        Ok(buf)
     }
 
     pub fn compute_pipeline(
