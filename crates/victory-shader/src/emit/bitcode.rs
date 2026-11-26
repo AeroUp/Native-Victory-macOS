@@ -604,6 +604,29 @@ impl Module {
             .collect()
     }
 
+    /// The name and constant arguments of each call of `name` that [`Module::write`] writes
+    /// (`None` for an argument that is not a constant): what the emitted `dx.op` calls asked for.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<(String, Vec<Option<i64>>)> {
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    return None;
+                };
+                let callee = &self.funcs[*f as usize].name;
+                // A family is asked for by its stem (`dx.op.wavePrefixOp` finds
+                // `dx.op.wavePrefixOp.f32`): the type suffix is part of the name.
+                if !callee.starts_with(name) {
+                    return None;
+                }
+                Some((callee.clone(), args.iter().map(|&a| self.int_value(a)).collect()))
+            })
+            .collect()
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {

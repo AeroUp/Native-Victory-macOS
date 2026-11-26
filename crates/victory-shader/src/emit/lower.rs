@@ -11486,8 +11486,15 @@ impl<'a> Lower<'a> {
         // A heap-indexed buffer read by element has no used-resource entry,
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
+        // A used-resource entry that names no stride (0) is the same case: the
+        // descriptor's stride is read from title memory at run time, so the
+        // host's view-stride table has it, and the element index becomes a
+        // byte offset (the view then needs no stride of its own).
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
+            Some(i)
+                if !typed
+                    && used.is_none_or(|u| u.stride == 0 && u.kind != ResourceType::Cbv) =>
+            {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
