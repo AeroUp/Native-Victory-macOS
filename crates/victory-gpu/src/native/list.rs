@@ -300,6 +300,18 @@ pub struct NativeList<B: GraphicsBackend> {
 }
 
 fn set<B: GraphicsBackend>(root: &mut Vec<Option<Root<B>>>, slot: usize, value: Root<B>) {
+    // A D3D12 root signature has 64 slots (0..=63). A slot past that is a bad argument or a stale
+    // root signature, and growing the list to `slot + 1` entries for it used to ask for billions
+    // of them (issue #15: a slot of 0xffff_ffff).
+    if slot >= 64 {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&slot) {
+            seen.push(slot);
+            tracing::warn!(slot, "a root parameter slot past the 64 D3D12 has: ignored");
+        }
+        return;
+    }
     if root.len() <= slot {
         root.resize_with(slot + 1, || None);
     }
