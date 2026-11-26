@@ -22,6 +22,11 @@ pub struct Metal {
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+    /// Heaps already named to the command buffer being encoded (pointer, entry count): without
+    /// residency sets every entry is named with `useResource`, and the world's first frames draw
+    /// thousands of times through heaps of tens of thousands of entries, so naming each heap once
+    /// per command buffer is the difference between seconds and minutes.
+    pub(crate) named: std::cell::RefCell<std::collections::HashSet<(usize, usize)>>,
 }
 
 /// Counters of residency work.
@@ -109,6 +114,7 @@ impl Metal {
             residency_sets,
             pool_set: Default::default(),
             counts: Default::default(),
+            named: Default::default(),
         })
     }
 
