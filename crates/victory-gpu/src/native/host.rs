@@ -59,6 +59,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
+    /// For each texture key, the heap entries that name it: what to rewrite if the texture behind
+    /// the key is replaced (a placeholder until its content arrives, or evicted under a budget).
+    owners: RefCell<HashMap<usize, Vec<(Rc<NativeHeap<B>>, usize, u64)>>>,
     contract: RefCell<Contract<B>>,
 }
 
@@ -137,6 +140,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
+            owners: RefCell::default(),
             contract: RefCell::default(),
         }
     }
@@ -257,6 +261,34 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);
+        self.owners.borrow_mut().remove(&key);
+    }
+
+    /// Notes that heap entry `index` (descriptor `handle`) names texture `key`, so the entry can
+    /// be rewritten if the texture behind the key is replaced.
+    fn note_owner(&self, key: usize, heap: &Rc<NativeHeap<B>>, index: usize, handle: u64) {
+        let mut owners = self.owners.borrow_mut();
+        let list = owners.entry(key).or_default();
+        if !list
+            .iter()
+            .any(|(h, i, _)| *i == index && Rc::ptr_eq(h, heap))
+        {
+            list.push((heap.clone(), index, handle));
+        }
+    }
+
+    /// Rewrites every heap entry that names texture `key` from its title view record: called after
+    /// the texture behind a key is replaced.
+    pub fn rewrite_key(&self, key: usize) {
+        let handles: Vec<u64> = self
+            .owners
+            .borrow()
+            .get(&key)
+            .map(|l| l.iter().map(|&(_, _, h)| h).collect())
+            .unwrap_or_default();
+        for handle in handles {
+            let _ = self.mirror(handle);
+        }
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -320,6 +352,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                self.note_owner(resource, &heap, index, handle);
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;

@@ -30,6 +30,9 @@ pub static TEXTURE_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Realized textures whose title memory is no longer mapped, and their bytes.
 pub static UNMAPPED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UNMAPPED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Textures whose memory was entirely zero at their first upload (content not streamed in yet).
+pub static BLANK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BLANK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `D3D12_RESOURCE_FLAGS`.
 const RENDER_TARGET: u32 = 1;
@@ -293,11 +296,25 @@ impl<B: PresentBackend> Title<B> {
         if self.textures.contains_key(&key) {
             return true;
         }
-        let Some(info) = self.pending.remove(&key) else {
+        let Some(info) = self.pending.get(&key).cloned() else {
             return false;
         };
-        PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let Some(desc) = info.desc() else {
+        // A texture whose memory is no longer in a mapped pool is a descriptor the title left
+        // behind (or one written before the pool was mapped): the host could only read zeros, and
+        // a full-size host texture of zeros is the largest waste the host has. It stays pending,
+        // so a later view of it tries again once its memory is mapped.
+        if self
+            .host
+            .memory()
+            .resolve(info.memory as u64, info.size as u64)
+            .is_none()
+        {
+            UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        self.pending.remove(&key);
+        PENDING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);        let Some(desc) = info.desc() else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -314,21 +331,8 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
-        // A texture whose memory is no longer in a mapped pool is a descriptor the title left
-        // behind: its host copy would be read from unmapped memory, and its bytes are the largest
-        // consumer we have. `VICTORY_SKIP_UNMAPPED` skips it; without it the case is only counted.
-        if self
-            .host
-            .memory()
-            .resolve(info.memory as u64, info.size as u64)
-            .is_none()
-        {
-            UNMAPPED_BYTES.fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
-            UNMAPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if std::env::var_os("VICTORY_SKIP_UNMAPPED").is_some() {
-                return false;
-            }
-        }
+        // (The unmapped check above ran before the texture was made: an unmapped title texture
+        // never gets here, so there is no second copy to drop.)
         self.host.register_texture(key, &tex);
         // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
         // it changes, as it is not otherwise seen (a GPU write never changes title memory).
@@ -346,6 +350,23 @@ impl<B: PresentBackend> Title<B> {
         }
         if !info.render_target() {
             self.unloaded.insert(key);
+        }
+        // The large ones, once each: what a texture budget has to think about.
+        if info.size >= (8 << 20) {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                tracing::info!(
+                    key = format_args!("{key:#x}"),
+                    w = info.width,
+                    h = info.height,
+                    layers = info.depth_or_layers,
+                    mips = info.layout.mips.len(),
+                    format = info.format,
+                    flags = info.flags,
+                    mb = info.size as f64 / (1u64 << 20) as f64,
+                    "a large title texture"
+                );
+            }
         }
         let bytes = info.size as u64;
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -502,8 +523,13 @@ impl<B: PresentBackend> Title<B> {
             if t.last == Some(hash) {
                 continue;
             }
+            let blank = tiled.iter().all(|&b| b == 0);
+            if blank && t.uploads == 0 {
+                BLANK_BYTES.fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
+                BLANK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Written again after its first upload, or blank at it (written later): hot.
-            if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
+            if !t.info.render_target() && (t.uploads > 0 || blank) {
                 if t.hot == 0 {
                     hot_keys.push(*key);
                 }

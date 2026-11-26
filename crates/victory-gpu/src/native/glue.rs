@@ -675,6 +675,8 @@ pub(crate) fn log_draw_counts(frame: u64) {
         unmapped = crate::native::textures::UNMAPPED_COUNT.load(Relaxed),
         unmapped_gb =
             crate::native::textures::UNMAPPED_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64,
+        blank = crate::native::textures::BLANK_COUNT.load(Relaxed),
+        blank_gb = crate::native::textures::BLANK_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64,
         "texture footprint"
     );
     let (touched, writes) = crate::native::host::touched_take();
