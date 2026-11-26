@@ -418,8 +418,11 @@ impl<B: PresentBackend> Title<B> {
         let mut signal = |n: usize, _: u64| {
             match actions.get(&n) {
                 Some(QueuedAction::Signal(q, f, value)) => {
+                    // A signal that could not be queued is kept: the title waits on it, and
+                    // dropping it here loses the value it names for good (nothing retries).
                     if let Err(e) = host.execute(q, &[], &[], &[(&**f, *value)]) {
-                        tracing::warn!(error = %e, "a held fence signal was not queued");
+                        tracing::warn!(error = %e, "a held fence signal was not queued; it stays queued");
+                        return false;
                     }
                 }
                 Some(QueuedAction::Present(queue, surface, texture)) => {
