@@ -329,6 +329,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
         });
     }
 
+    /// The host dropped the texture of title texture `key` (the texture budget): the registration
+    /// goes, the owner entries stay, so a later bind rewrites them to the new texture.
+    pub fn forget_texture(&self, key: usize) {
+        self.resources.borrow_mut().remove(&key);
+    }
+
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);

@@ -357,7 +357,7 @@ pub fn run(
                         last = (frames, Instant::now());
                         continue;
                     }
-                    if last.1.elapsed() < Duration::from_secs(8) {
+                    if last.1.elapsed() < Duration::from_secs(3) {
                         continue;
                     }
                     tracing::warn!(

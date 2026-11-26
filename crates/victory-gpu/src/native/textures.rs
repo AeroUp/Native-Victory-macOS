@@ -27,6 +27,8 @@ pub static TEXTURE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static TARGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PENDING_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TEXTURE_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bumped on every texture bind: the order the budget evicts in.
+static BIND_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Realized textures whose title memory is no longer mapped, and their bytes.
 pub static UNMAPPED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UNMAPPED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -35,6 +37,19 @@ pub static BLANK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static BLANK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Textures bound to a placeholder because their content had not arrived (VICTORY_TEXTURE_LAZY).
 pub static LAZY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The host texture budget in bytes, from `VICTORY_METAL_TEXTURE_BUDGET_MB` (default 1536 MiB;
+/// 0 turns the budget off).
+fn texture_budget() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let mb: u64 = std::env::var("VICTORY_METAL_TEXTURE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1536);
+        (mb > 0).then_some(mb << 20)
+    })
+}
 
 /// `D3D12_RESOURCE_FLAGS`.
 const RENDER_TARGET: u32 = 1;
@@ -264,6 +279,8 @@ pub struct Tracked<B: ResourceBackend> {
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
     pub uploads: u64,
+    /// When it was last bound (the tick of the bind): what the budget evicts from.
+    used: u64,
     /// Submissions left in which its memory is probed at submission rather than left to the
     /// scanner (0: cold), and the hash of what the last probe read.
     hot: u32,
@@ -465,6 +482,7 @@ impl<B: PresentBackend> Title<B> {
                 );
             }
         }
+        let evicted = self.evicted.remove(&key);
         let bytes = if blank { 0 } else { info.size as u64 };
         if bytes > 0 {
             TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -480,12 +498,17 @@ impl<B: PresentBackend> Title<B> {
                 info,
                 bytes,
                 blank,
+                used: 0,
                 last: None,
                 uploads: 0,
                 hot: 0,
                 probe: None,
             },
         );
+        if evicted {
+            // Heap entries still name the texture the budget dropped: they point at the new one.
+            self.host.rewrite_key(key);
+        }
         true
     }
 
@@ -524,7 +547,71 @@ impl<B: PresentBackend> Title<B> {
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
-        self.textures.get(&key).map(|t| t.texture.clone())
+        let tick = BIND_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.textures.get_mut(&key).map(|t| {
+            t.used = tick;
+            t.texture.clone()
+        })
+    }
+
+    /// Keeps realized host textures under the byte budget by dropping the sampled ones bound
+    /// longest ago: their title memory is still the authority (the scanner uploads what changed),
+    /// so the next bind makes the texture again and fills it, and a world's streaming set no longer
+    /// costs its whole texturing budget for the life of the process. Render targets are never
+    /// dropped: what the GPU drew into them exists nowhere else.
+    ///
+    /// `VICTORY_METAL_TEXTURE_BUDGET_MB` sets the budget in MiB (0 or a bad value: no limit). The
+    /// default is 1536 MiB, about what the menus and a story load need; a texture that is bound
+    /// every frame is the newest and is never the one dropped.
+    pub fn evict_to_budget(&mut self) {
+        let Some(budget) = texture_budget() else { return };
+        let mut used = TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if used <= budget {
+            return;
+        }
+        let mut candidates: Vec<(u64, usize, u64)> = self
+            .textures
+            .iter()
+            .filter(|(_, t)| !t.info.render_target() && t.bytes > 0 && !t.blank)
+            .map(|(&k, t)| (t.used, k, t.bytes))
+            .collect();
+        candidates.sort_unstable();
+        let (mut count, mut freed, mut first) = (0u32, 0u64, true);
+        for (_, key, bytes) in candidates {
+            if used <= budget {
+                break;
+            }
+            let Some(t) = self.textures.remove(&key) else { continue };
+            // The title's description goes back to the pending set: a later bind makes the
+            // texture again and uploads its memory.
+            self.texture_created(key, t.info.clone());
+            TEXTURE_BYTES.fetch_sub(t.bytes, std::sync::atomic::Ordering::Relaxed);
+            TEXTURE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            TEXTURE_EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.evicted.insert(key);
+            self.unloaded.remove(&key);
+            self.hot_keys.retain(|&k| k != key);
+            watch(|w| {
+                w.entries.remove(&key);
+                w.dirty.remove(&key);
+            });
+            self.host.forget_texture(key);
+            used -= t.bytes;
+            freed += t.bytes;
+            count += 1;
+            if first {
+                tracing::info!(budget_mb = budget >> 20, used_mb = used >> 20, "host texture budget reached: evicting");
+                first = false;
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                evicted = count,
+                freed_mb = freed >> 20,
+                now_mb = TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+                "host textures evicted to stay under the budget"
+            );
+        }
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -568,6 +655,7 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
     /// found changed since.
     pub fn sync_dirty(&mut self) {
+        self.evict_to_budget();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously in O(1) bounded
         // batches so world streaming (thousands of blank textures) never stalls submissions.

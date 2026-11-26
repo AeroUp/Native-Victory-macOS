@@ -211,6 +211,9 @@ pub struct Title<B: PresentBackend> {
     pub(super) surface: Option<Rc<B::Surface>>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
+    /// Textures the budget dropped although heap entries still name them: their next bind rewrites
+    /// those entries to the new host texture.
+    pub(super) evicted: std::collections::HashSet<usize>,
     /// The small textures title textures without content are bound to, one per format and shape.
     pub(super) placeholders: Vec<(
         victory_backend::resources::Format,
@@ -245,6 +248,7 @@ impl<B: PresentBackend> Title<B> {
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
+            evicted: std::collections::HashSet::new(),
             placeholders: Vec::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
