@@ -408,9 +408,9 @@ impl<B: PresentBackend> Title<B> {
         };
         // A world load realizes thousands of textures whose content has not been streamed in yet
         // (all zeros in title memory). A full-size host texture of zeros costs the same as content
-        // and shows the same (black), so with VICTORY_TEXTURE_LAZY they start on one small
-        // placeholder per format and shape, and get their own texture when content arrives.
-        let lazy = !desc.render_target && std::env::var_os("VICTORY_TEXTURE_LAZY").is_some();
+        // and shows the same (black), so they start on one small placeholder per format and shape
+        // and get their own texture when content arrives (VICTORY_TEXTURE_NO_LAZY turns it off).
+        let lazy = !desc.render_target && std::env::var_os("VICTORY_TEXTURE_NO_LAZY").is_none();
         let (tex, blank) = if lazy {
             match self.placeholder_for(&desc) {
                 Some(p) => (p, true),

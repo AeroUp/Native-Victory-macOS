@@ -762,6 +762,30 @@ fn make_host_pipe(
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
     graphics: Option<super::state::Graphics>,
 ) -> Pipe<Metal> {
+    // The world's first frames create twenty-odd pipelines in a burst; a conversion and a Metal
+    // compile each can take seconds, and the title's own watchdog takes the frame down meanwhile.
+    let started = std::time::Instant::now();
+    let name_of = |stages: &[(&'static str, Arc<crate::pipeline::Shader>)]| {
+        stages
+            .iter()
+            .map(|(stage, s)| format!("{stage} {}", s.hash))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let label = name_of(&stages);
+    let made = make_host_pipe_inner(t, stages, graphics);
+    let ms = started.elapsed().as_millis();
+    if ms >= 200 {
+        tracing::info!(ms, pipeline = %label, "a host pipeline took its time");
+    }
+    made
+}
+
+fn make_host_pipe_inner(
+    t: &mut MetalTitle,
+    stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
+    graphics: Option<super::state::Graphics>,
+) -> Pipe<Metal> {
     if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
         return Pipe::Skipped;
     }
