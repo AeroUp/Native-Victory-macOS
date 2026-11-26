@@ -44,6 +44,14 @@ impl ValueWait {
     /// comparison we do not know (counted by the caller, taken as holding)
     /// and for memory that cannot be read (taken as not holding).
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
+        // VICTORY_IGNORE_VALUE_WAITS=1: run a queue's work as it comes, as if every value it waits
+        // for were already there. The title writes its per-frame semaphores at the end of the lists
+        // that draw, so a list that waits at its start on a value another held list writes
+        // deadlocks; this shows what the frame looks like without the wait.
+        static IGNORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *IGNORE.get_or_init(|| std::env::var_os("VICTORY_IGNORE_VALUE_WAITS").is_some()) {
+            return Some(true);
+        }
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
