@@ -1673,3 +1673,101 @@ fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
         ShaderError::Unsupported { offset: at + 12, what: "a computed buffer descriptor used as a view" }
     );
 }
+
+// =========================================================================
+// An image store of some channels
+// =========================================================================
+
+/// A minimal compute program whose descriptor tables start at `s0`.
+fn lower_cs(words: &[u32], used: Vec<UsedResource>) -> Result<Lowered, ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: bytes_of(words),
+    };
+    let p = ir::build(&native.code, false, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    })
+}
+
+#[test]
+fn image_store_of_some_channels_writes_only_them() {
+    // The image at heap index 0 in the table at s0; v0/v1 the texel, v2/v3
+    // the two channels dmask 0x5 (red and blue) enables.
+    let code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF020_1508,
+        0x0002_0200, // image_store v[2:3], v[0:1], s[8:15] dmask:0x5 dim:2D
+        0xBF81_0000, // s_endpgm
+    ];
+    let l = lower_cs(&code, vec![uav()]).expect("an image store of some channels");
+    assert_eq!(l.image_store_masks, [0x5], "only red and blue are written");
+
+    // d16 packs the two enabled channels into one register: red low, blue
+    // high (data registers count enabled channels, not channel indices).
+    let mut d16 = code;
+    d16[10] = 0x8002_0200; // image_store_d16 v2, v[0:1], s[8:15] dmask:0x5
+    let l = lower_cs(&d16, vec![uav()]).expect("a d16 store of red and blue");
+    assert_eq!(l.image_store_masks, [0x5]);
+
+    // dmask 0 enables no channel: nothing is written.
+    let mut none = code;
+    none[9] = 0xF020_1008; // dmask:0
+    let l = lower_cs(&none, vec![uav()]).expect("an image store of no channels");
+    assert!(l.image_store_masks.is_empty());
+}
+
+fn uav() -> UsedResource {
+    UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    }
+}

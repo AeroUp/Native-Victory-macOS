@@ -85,6 +85,9 @@ pub(crate) struct Lowered {
     /// Whether the DXIL holds the group-shared array host waves exchange in.
     #[cfg(test)]
     pub exchanges: bool,
+    /// The write mask of each image store.
+    #[cfg(test)]
+    pub image_store_masks: Vec<u8>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1590,6 +1593,8 @@ impl<'a> Lower<'a> {
             barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             exchanges: self.s.xchg_used(),
+            #[cfg(test)]
+            image_store_masks: self.s.m.written_call_masks("dx.op.textureStore.f32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -10059,8 +10064,13 @@ impl<'a> Lower<'a> {
         if name.starts_with("image_bvh") {
             return self.bvh(inst, b, i);
         }
-        // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        // A load or sample with no channel enabled returns the first; a
+        // store with no channel enabled writes nothing.
+        let dmask = if *dmask == 0 && !name.starts_with("image_store") {
+            &1
+        } else {
+            dmask
+        };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -10265,10 +10275,13 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // The store writes the channels its dmask enables, from data
+            // registers that are consecutive over the enabled channels, and
+            // leaves the texel's other channels as they were: DXIL's store
+            // mask carries exactly that (a format with fewer channels keeps
+            // the channels it has). d16 packs two f16 channels per register.
+            if *dmask == 0 {
+                return Ok(());
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -10278,14 +10291,18 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let fu = self.s.m.undef(self.s.t.f32);
+            let mut vals = vec![fu; 4];
+            for (slot, ch) in (0..4u32)
+                .filter(|ch| dmask >> ch & 1 != 0)
+                .enumerate()
+            {
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { (slot / 2) as u8 } else { slot as u8 };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[ch as usize] = if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if slot % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -10294,14 +10311,14 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
-            args.push(self.s.m.i8(0xF));
+            args.push(self.s.m.i8(*dmask));
             let void = self.s.t.void;
             self.s.op(
                 self.cur,

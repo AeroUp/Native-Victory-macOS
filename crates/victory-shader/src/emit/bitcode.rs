@@ -584,6 +584,26 @@ impl Module {
         }
     }
 
+    /// The last `i8` argument of each call of `name` that [`Module::write`]
+    /// writes (a store's write mask).
+    #[cfg(test)]
+    pub fn written_call_masks(&self, name: &str) -> Vec<u8> {
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    return None;
+                };
+                if self.funcs[*f as usize].name != name {
+                    return None;
+                }
+                self.int_value(*args.last()?).map(|x| x as u8)
+            })
+            .collect()
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
