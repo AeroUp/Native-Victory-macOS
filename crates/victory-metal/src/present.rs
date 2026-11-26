@@ -114,12 +114,11 @@ impl Metal {
             width: width as f64,
             height: height as f64,
         });
-        // The window's own size scales the drawable; the title renders at the size asked here.
-        // SAFETY: plain properties of CAMetalLayer.
-        let _: () = unsafe {
-            let _: () = msg_send![&*layer, setAutoResizeDrawable: objc2::runtime::Bool::NO];
-            msg_send![&*layer, setDisplaySyncEnabled: false]
-        };
+        // SAFETY: a plain BOOL property of CAMetalLayer.
+        // (auto-resize stays on: an unrecognised `setAutoResizeDrawable:` throws an Objective-C
+        // exception that aborts the process, and with the window smaller than the layer the
+        // drawable follows the view, so the present blit costs less.)
+        let _: () = unsafe { msg_send![&*layer, setDisplaySyncEnabled: false] };
         Layer(layer)
     }
 }
