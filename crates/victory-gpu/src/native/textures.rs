@@ -174,6 +174,9 @@ fn start_scanner() {
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
             let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
+            let mut rounds = 0u64;
+            let mut since = std::time::Instant::now();
+            let (mut bytes, mut entries) = (0u64, 0usize);
             loop {
                 let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
@@ -186,11 +189,29 @@ fn start_scanner() {
                         let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
                         h.update(&buf[..n]);
                     }
+                    bytes += size as u64;
+                    entries += 1;
                     let h = h.finalize();
                     let before = seen.insert(key, h);
                     if before != Some(h) && !(target && before.is_none()) {
                         watch(|w| w.dirty.insert(key));
                     }
+                }
+                rounds += 1;
+                if since.elapsed().as_secs() >= 5 {
+                    // The round's cost is the title's texture bandwidth: at 16 000 textures this
+                    // is gigabytes per round, so the figure matters for the frame rate.
+                    tracing::info!(
+                        rounds,
+                        entries,
+                        gb = bytes as f64 / (1u64 << 30) as f64,
+                        seconds = format_args!("{:.1}", since.elapsed().as_secs_f64()),
+                        "texture scanner: hashed the watched set"
+                    );
+                    rounds = 0;
+                    bytes = 0;
+                    entries = 0;
+                    since = std::time::Instant::now();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
