@@ -52,6 +52,9 @@ pub struct Heap {
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+    /// Entries written so far: a heap named to an encoder must be named again after a write
+    /// (without residency sets the encoder only knows what it was told).
+    writes: Cell<u64>,
 }
 
 impl Drop for Heap {
@@ -487,7 +490,7 @@ impl Metal {
         let key = (
             ProtocolObject::from_ref(&*heap.buf) as *const ProtocolObject<dyn MTLResource>
                 as *const () as usize,
-            heap.refs.borrow().len(),
+            heap.writes.get() as usize,
         );
         if !self.named.borrow_mut().insert(key) {
             return;
@@ -614,6 +617,7 @@ impl ResourceBackend for Metal {
             alloc_counts: RefCell::default(),
             set,
             dirty: Cell::new(false),
+            writes: Cell::new(0),
         })
     }
     fn heap_address(&self, heap: &Heap, index: usize) -> u64 {
