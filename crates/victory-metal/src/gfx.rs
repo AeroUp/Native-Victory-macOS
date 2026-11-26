@@ -111,6 +111,77 @@ fn note_op(op: Op) {
     }
 }
 
+/// The command buffer being encoded and committed, with the work it was given: a command buffer
+/// that never completes (a GPU hang or a Metal timeout) is otherwise invisible, because only a
+/// completion logs anything.
+static INFLIGHT: std::sync::Mutex<Option<(u64, std::time::Instant, Vec<Op>)>> =
+    std::sync::Mutex::new(None);
+static NEXT_CB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCHDOG: std::sync::Once = std::sync::Once::new();
+
+/// Logs the command buffer still in flight after eight seconds, once per command buffer.
+fn arm_watchdog() {
+    WATCHDOG.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory gpu watchdog".into())
+            .spawn(|| {
+                let mut reported = 0u64;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let mut slot = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some((id, at, ops)) = slot.as_ref() else {
+                        continue;
+                    };
+                    if at.elapsed().as_secs() < 8 || *id == reported {
+                        continue;
+                    }
+                    reported = *id;
+                    let dispatches = ops
+                        .iter()
+                        .filter(|o| matches!(o, Op::Compute { .. }))
+                        .count();
+                    let mut largest: Vec<(usize, [usize; 3], [usize; 3])> = ops
+                        .iter()
+                        .filter_map(|op| match op {
+                            Op::Compute { groups, threads } => Some((
+                                groups[0] * groups[1] * groups[2]
+                                    * threads[0]
+                                    * threads[1]
+                                    * threads[2],
+                                *groups,
+                                *threads,
+                            )),
+                            Op::Render { .. } => None,
+                        })
+                        .collect();
+                    largest.sort_by_key(|e| std::cmp::Reverse(e.0));
+                    let top: Vec<String> = largest
+                        .iter()
+                        .take(6)
+                        .map(|(n, g, t)| format!("{n} invocations g={g:?} t={t:?}"))
+                        .collect();
+                    let render: Vec<String> = ops
+                        .iter()
+                        .filter_map(|op| match op {
+                            Op::Render {
+                                draws,
+                                w,
+                                h,
+                                geometry,
+                            } => Some(format!("{draws} draws {w}x{h} {geometry} primitives")),
+                            Op::Compute { .. } => None,
+                        })
+                        .collect();
+                    eprintln!(
+                        "metal: command buffer {id} still in flight after {} s: {dispatches} dispatches, largest {top:?}, {} render passes {render:?}",
+                        at.elapsed().as_secs(),
+                        render.len()
+                    );
+                }
+            });
+    });
+}
+
 fn take_ops() -> Vec<Op> {
     OPS.lock()
         .map(|mut v| std::mem::take(&mut *v))
@@ -925,11 +996,21 @@ impl GraphicsBackend for Metal {
         // never reached the GPU, and the two need different fixes.
         let queued = std::time::Instant::now();
         let ops = take_ops();
+        arm_watchdog();
+        let id = NEXT_CB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((id, queued, ops.clone()));
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
             let ms = queued.elapsed().as_millis();
+            {
+                let mut slot = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(i, _, _)| *i == id) {
+                    *slot = None;
+                }
+            }
             if ms >= 500 || done.error().is_some() {
                 // The biggest dispatches first: the one that ran long is among them.
                 let mut largest: Vec<(usize, [usize; 3], [usize; 3])> = ops
