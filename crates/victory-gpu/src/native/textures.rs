@@ -177,25 +177,38 @@ fn start_scanner() {
             let mut rounds = 0u64;
             let mut since = std::time::Instant::now();
             let (mut bytes, mut entries) = (0u64, 0usize);
+            // The whole watched set is gigabytes once the world is loaded (16 000 textures), and
+            // hashing all of it every round took seconds of memory bandwidth away from the title.
+            // A quarter of it per round keeps the same latency at a fraction of the cost.
+            let mut cursor = 0usize;
             loop {
                 let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
-                seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for &(key, (at, size, target)) in &list {
-                    let mut h = blake3::Hasher::new();
-                    for off in (0..size).step_by(buf.len()) {
-                        let n = buf.len().min(size - off);
-                        buf[..n].fill(0);
-                        let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
-                        h.update(&buf[..n]);
+                if !list.is_empty() {
+                    let live: std::collections::HashSet<usize> =
+                        list.iter().map(|&(k, _)| k).collect();
+                    seen.retain(|k, _| live.contains(k));
+                }
+                if !list.is_empty() {
+                    let batch = (list.len() / 4).max(1);
+                    for i in 0..batch {
+                        let (key, (at, size, target)) = list[(cursor + i) % list.len()];
+                        let mut h = blake3::Hasher::new();
+                        for off in (0..size).step_by(buf.len()) {
+                            let n = buf.len().min(size - off);
+                            buf[..n].fill(0);
+                            let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+                            h.update(&buf[..n]);
+                        }
+                        bytes += size as u64;
+                        entries += 1;
+                        let h = h.finalize();
+                        let before = seen.insert(key, h);
+                        if before != Some(h) && !(target && before.is_none()) {
+                            watch(|w| w.dirty.insert(key));
+                        }
                     }
-                    bytes += size as u64;
-                    entries += 1;
-                    let h = h.finalize();
-                    let before = seen.insert(key, h);
-                    if before != Some(h) && !(target && before.is_none()) {
-                        watch(|w| w.dirty.insert(key));
-                    }
+                    cursor = (cursor + batch) % list.len();
                 }
                 rounds += 1;
                 if since.elapsed().as_secs() >= 5 {
@@ -206,14 +219,14 @@ fn start_scanner() {
                         entries,
                         gb = bytes as f64 / (1u64 << 30) as f64,
                         seconds = format_args!("{:.1}", since.elapsed().as_secs_f64()),
-                        "texture scanner: hashed the watched set"
+                        "texture scanner: hashed part of the watched set"
                     );
                     rounds = 0;
                     bytes = 0;
                     entries = 0;
                     since = std::time::Instant::now();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
     });

@@ -62,6 +62,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// For each texture key, the heap entries that name it: what to rewrite if the texture behind
     /// the key is replaced (a placeholder until its content arrives, or evicted under a budget).
     owners: RefCell<HashMap<usize, Vec<(Rc<NativeHeap<B>>, usize, u64)>>>,
+    /// Buffers over memory the runtime allocated itself (not in a title pool), by page address.
+    host_buffers: RefCell<HashMap<usize, (usize, Rc<B::Buffer>)>>,
     contract: RefCell<Contract<B>>,
 }
 
@@ -141,6 +143,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             resources: RefCell::default(),
             heaps: RefCell::default(),
             owners: RefCell::default(),
+            host_buffers: RefCell::default(),
             contract: RefCell::default(),
         }
     }
@@ -156,12 +159,39 @@ impl<B: GraphicsBackend> NativeHost<B> {
         for gone in self.memory.take_released() {
             buffers.remove(&gone);
         }
-        let (pool, ptr) = self
-            .memory
-            .resolve(addr, len)
-            .ok_or_else(|| format!("title address {addr:#x}+{len:#x} is not in a mapped pool"))?;
+        let Some((pool, ptr)) = self.memory.resolve(addr, len) else {
+            drop(buffers);
+            return self.wrap_host(addr, len);
+        };
         drop(buffers);
         Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+    }
+
+    /// A buffer over memory the title address table does not know. The runtime allocates some
+    /// resources in this process's own memory (the swapchain's images, a video's staging), and a
+    /// view of one names that pointer directly; wrapping it is the same no-copy path, with the
+    /// range grown to whole pages as Metal requires.
+    fn wrap_host(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        let mut probe = [0u8; 16];
+        if !super::safe_read(addr as *const u8, &mut probe) {
+            return Err(format!(
+                "title address {addr:#x}+{len:#x} is not in a mapped pool"
+            ));
+        }
+        let start = (addr as usize) & !0xFFF;
+        let end = ((addr as usize).saturating_add(len.max(1) as usize) + 0xFFF) & !0xFFF;
+        let mut cache = self.host_buffers.borrow_mut();
+        if let Some((covered, buf)) = cache.get(&start)
+            && *covered >= end
+        {
+            return Ok((buf.clone(), addr as *const u8));
+        }
+        let buf = Rc::new(
+            self.backend
+                .wrap_title_memory(start as *mut u8, end - start)?,
+        );
+        cache.insert(start, (end, buf.clone()));
+        Ok((buf, addr as *const u8))
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.
