@@ -372,8 +372,24 @@ fn log_pending(this: Array, index: u32, polls: u64) {
         .iter()
         .filter(|(_, l)| l.entries() > 0)
         .map(|(id, l)| {
+            // The request at the front of the lane's queue: what it waits for
+            // (a read into physical pages waits for the title to fill its
+            // list), and whether a status sits behind it.
+            let running: Vec<String> = l
+                .running_what
+                .iter()
+                .map(|(seq, (options, dst, src, offset, name))| {
+                    format!("running seq {seq} options {options:#x} dst {dst} src {src} offset {offset} file {name}")
+                })
+                .collect();
+            let front = l.reads.front().map_or_else(String::new, |(seq, r)| {
+                format!(
+                    " front seq {seq} options {:#x} dst {} src {} offset {}",
+                    r.options, r.destination_size, r.source_size, r.offset
+                )
+            });
             format!(
-                "lane {id}: unsubmitted {} held {} reads {} statuses {} running {} failures {} capacity {}",
+                "lane {id}: unsubmitted {} held {} reads {} statuses {} running {} failures {} capacity {}{front}",
                 l.unsubmitted.len(),
                 l.held.len(),
                 l.reads.len(),
@@ -381,10 +397,20 @@ fn log_pending(this: Array, index: u32, polls: u64) {
                 l.running.len(),
                 l.failures.len(),
                 l.capacity
-            )
+            ) + &running.join("; ")
         })
         .collect();
-    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, "dstorage: a status entry is still pending");
+    tracing::warn!(
+        array = ?this,
+        index,
+        polls,
+        staged = lanes.staged,
+        staging = lanes.staging,
+        done = lanes.done.0,
+        refused = lanes.refused,
+        ?state,
+        "dstorage: a status entry is still pending"
+    );
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -468,6 +494,9 @@ struct Lane {
     reads: VecDeque<(u64, Request)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
+    /// What each running read is (options, sizes, offset), for the log of a
+    /// status entry that never completes.
+    running_what: BTreeMap<u64, (u64, u32, u32, u64, String)>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
 }
@@ -641,6 +670,17 @@ impl Lanes {
         }
         lane.reads.pop_front();
         lane.running.insert(seq);
+        lane.running_what
+            .insert(
+                seq,
+                (
+                    request.options,
+                    request.destination_size,
+                    request.source_size,
+                    request.offset,
+                    source_name(&request).to_owned(),
+                ),
+            );
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -659,6 +699,7 @@ impl Lanes {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
+            lane.running_what.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
             }
@@ -736,6 +777,7 @@ impl Lane {
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
+            running_what: BTreeMap::new(),
             failures: BTreeMap::new(),
             closed: false,
         }
@@ -1051,11 +1093,29 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
+    // VICTORY_TRACE_INFLATE=1: every stream starts a line, so the one a
+    // worker never returns from is the last of them.
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_INFLATE").is_some());
+    if trace {
+        let head = &source[..source.len().min(16)];
+        tracing::info!(src = source.len(), out = out.len(), ?head, "inflate start");
+    }
+    let started = std::time::Instant::now();
+    let r = miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
         .map_err(|status| {
             tracing::debug!(?status, "dstorage: zlib stream");
             INVALID_DATA
-        })
+        });
+    if trace && started.elapsed().as_millis() > 100 {
+        tracing::warn!(
+            ms = started.elapsed().as_millis(),
+            src = source.len(),
+            out = out.len(),
+            "inflate slow"
+        );
+    }
+    r
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
