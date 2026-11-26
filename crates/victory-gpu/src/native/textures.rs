@@ -343,12 +343,15 @@ impl<B: PresentBackend> Title<B> {
         // descriptor the title left behind: reading it yields zeros and a full-size host texture of
         // zeros is the largest waste the host has. It stays pending, so a later view tries again.
         // Some resources (the swapchain's 4K images) are allocated by the runtime in host memory
-        // and have no title address at all: those read fine here and are kept.
-        if self
-            .host
-            .memory()
-            .resolve(info.memory as u64, info.size as u64)
-            .is_none()
+        // and have no title address at all: those read fine here and are kept. A render target is
+        // always kept: the GPU writes it and the host never reads title memory for it, so whether
+        // that memory is mapped says nothing about the pass that draws into it.
+        if !info.render_target()
+            && self
+                .host
+                .memory()
+                .resolve(info.memory as u64, info.size as u64)
+                .is_none()
         {
             let mut probe = [0u8; 16];
             if !super::safe_read(info.memory, &mut probe) {

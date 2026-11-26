@@ -449,6 +449,11 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
             .map(|r| r.resource as usize)
             .collect();
         let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
+        if color.len() < colors.len() {
+            // A pass part of whose attachments the host cannot make renders into the rest; with
+            // none left Metal refuses the encoder and the piece is dropped.
+            warn_once("a render target with no host texture");
+        }
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
         l.target_keys = colors.iter().copied().chain(depth_key).collect();
