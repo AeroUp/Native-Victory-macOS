@@ -420,3 +420,36 @@ fn what_has_no_form_is_refused_clearly() {
         "{r:?}"
     );
 }
+
+#[test]
+fn scalar_pack_takes_halves_of_each_source() {
+    // `s_pack_{ll,lh,hh}_b32_b16 s5, s0, s1` then `v_mov_b32 v1, s5`: one 16-bit half of each
+    // source into the low and high half of the result. All three shapes were refused as
+    // unsupported scalar operations, and compute programs use them to build packed keys.
+    for (word, which) in [
+        (0x9905_0706u32, "ll"),
+        (0x9985_0706, "lh"),
+        (0x9A05_0706, "hh"),
+    ] {
+        let body = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            word,        // s_pack_* s5, s6, s7
+            0x7E02_0205, // v_mov_b32 v1, s5
+        ];
+        lowered(&body, 1, false).unwrap_or_else(|e| panic!("s_pack_{which}: {e}"));
+    }
+}
+
+#[test]
+fn scalar_bitreplicate_fills_both_halves() {
+    // `s_bitreplicate_b64_b32 s[8:9], s6` then both halves read back: the 32-bit source lands in
+    // the low and the high dword. It was refused as an unsupported scalar operation.
+    let body = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE88_3B06, // s_bitreplicate_b64_b32 s[8:9], s6
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    lowered(&body, 1, false).expect("s_bitreplicate_b64_b32");
+}

@@ -4740,7 +4740,12 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        // A 64-bit destination; `s_bitreplicate_b64_b32` names its source's size in the suffix and
+        // still writes both halves.
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -4908,6 +4913,13 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
                     self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    // Both halves hold the 32-bit source ({s0, s0}).
+                    let a = src32(self, 0)?;
+                    self.set(lo, Val::I32(a));
+                    self.set(hi, Val::I32(a));
                     Ok(())
                 }
                 "s_mov_b64" => {
@@ -5106,6 +5118,26 @@ impl<'a> Lower<'a> {
                 let w = self.s.m.bin(c, Bin::LShr, b, k16);
                 let w = self.s.m.bin(c, Bin::And, w, k127);
                 (self.bfe(a, b, w, name == "s_bfe_i32"), None)
+            }
+            // Pack one 16-bit half of each source into the low and high half of the result: `ll`
+            // takes both lows, `lh` the low of src0 and the high of src1, `hh` both highs.
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, mask) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let a = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    a
+                };
+                let a = self.s.m.bin(c, Bin::And, a, mask);
+                let b = if name == "s_pack_lh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, b, k16)
+                } else {
+                    b
+                };
+                let b = self.s.m.bin(c, Bin::And, b, mask);
+                let hi = self.s.m.bin(c, Bin::Shl, b, k16);
+                (self.s.m.bin(c, Bin::Or, a, hi), None)
             }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
