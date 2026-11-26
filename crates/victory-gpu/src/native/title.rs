@@ -371,10 +371,18 @@ impl<B: PresentBackend> Title<B> {
         self.pump();
     }
 
+    /// How long a queue's head may wait for a memory value before it runs anyway. Windows uses ten
+    /// seconds; here the title's own watchdog ends the frame (and then the process) after a few
+    /// seconds without a present, so a deadlock has to be broken sooner to see where it is.
+    const VALVE: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Runs the heads of held queues that may run, until none can.
     pub fn pump(&mut self) {
         if self.held.is_empty() {
             return;
+        }
+        for (queue, waits) in self.held.force_older_than(Self::VALVE) {
+            tracing::warn!(queue, ?waits, "held work runs without its waits after {:?} (safety valve)", Self::VALVE);
         }
         let Title {
             host,
