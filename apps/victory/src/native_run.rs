@@ -309,7 +309,10 @@ pub fn run(
     let image: &'static NativeImage = Box::leak(Box::new(image));
     connect_gpu();
     // The title's graphics go to a layer: the window's, or one with no window.
-    let layer = victory_gpu::native::create_layer(crate::window::WIDTH, crate::window::HEIGHT)
+    let readable = std::env::var_os("VICTORY_FRAME_DUMP").is_some()
+        || std::env::var_os("VICTORY_READ_DRAWABLE").is_some();
+    let layer =
+        victory_gpu::native::create_layer(crate::window::WIDTH, crate::window::HEIGHT, readable)
         .map_err(|e| anyhow::anyhow!("no layer to present into: {e}"))?;
     victory_gpu::native::set_layer(layer.as_ptr())
         .map_err(|e| anyhow::anyhow!("no layer to present into: {e}"))?;

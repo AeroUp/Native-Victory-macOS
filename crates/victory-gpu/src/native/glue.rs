@@ -218,8 +218,13 @@ pub fn set_layer(layer: *mut std::ffi::c_void) -> Result<(), String> {
 
 /// A layer drawing to the host's device, `width` by `height`, for an app that has none (or a test):
 /// hand [`victory_metal::present::Layer::as_ptr`] to [`set_layer`] and keep the layer alive.
-pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::present::Layer, String> {
-    with_title(|t| t.host.backend.create_layer(width, height)).ok_or_else(|| "no native host GPU".into())
+pub fn create_layer(
+    width: usize,
+    height: usize,
+    readable: bool,
+) -> Result<victory_metal::present::Layer, String> {
+    with_title(|t| t.host.backend.create_layer(width, height, readable))
+        .ok_or_else(|| "no native host GPU".into())
 }
 
 /// `VICTORY_TRACE_TARGETS=1`: per frame, what drew into or cleared which title texture, and what

@@ -101,13 +101,15 @@ impl Layer {
 }
 
 impl Metal {
-    /// A layer drawing to this device: `width` by `height` drawables in BGRA, readable (not
-    /// frame-buffer only), vsync off.
-    pub fn create_layer(&self, width: usize, height: usize) -> Layer {
+    /// A layer drawing to this device: `width` by `height` drawables in BGRA, vsync off.
+    /// `readable` keeps the drawable CPU-readable (not frame-buffer only), which the frame dump
+    /// and the tests need; a real window leaves it false, so Metal can pick its direct-to-display
+    /// path for the 4K frame.
+    pub fn create_layer(&self, width: usize, height: usize, readable: bool) -> Layer {
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(&self.dev));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-        layer.setFramebufferOnly(false);
+        layer.setFramebufferOnly(!readable);
         layer.setDrawableSize(CGSize {
             width: width as f64,
             height: height as f64,

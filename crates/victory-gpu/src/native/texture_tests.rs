@@ -259,7 +259,7 @@ fn present_draws_the_back_buffer_over_the_apps_layer() {
     let heap = crate::descriptor::test_heap(false, 4);
     let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
     crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
-    let layer = glue::create_layer(32, 32).expect("a layer");
+    let layer = glue::create_layer(32, 32, true).expect("a layer");
     glue::set_layer(layer.as_ptr()).expect("a surface");
     let (q, f) = (crate::queue::test_queue(false), {
         let mut f = std::ptr::null();
