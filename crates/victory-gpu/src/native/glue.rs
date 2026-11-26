@@ -135,6 +135,8 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    let started = std::time::Instant::now();
+    let lists_n = lists.len();
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -146,6 +148,10 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         }
         t.submit(queue as usize, segments);
     });
+    let ms = started.elapsed().as_millis();
+    if ms >= 200 {
+        tracing::info!(ms, lists = lists_n, "a command list submission took its time");
+    }
 }
 
 pub(crate) fn queue_signal(queue: This, fence: This, value: u64) {
