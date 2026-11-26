@@ -27,8 +27,8 @@ pub const HEIGHT: usize = 1080;
 /// The window's size on screen, in points. The layer keeps [`WIDTH`]x[`HEIGHT`] drawables and the
 /// window scales them down, so the title still renders at its own size while the window leaves the
 /// rest of the desktop visible.
-pub const VIEW_WIDTH: usize = 1280;
-pub const VIEW_HEIGHT: usize = 720;
+pub const VIEW_WIDTH: usize = 960;
+pub const VIEW_HEIGHT: usize = 540;
 
 /// Shows a window over `layer` (a `CAMetalLayer`) and runs `title` on a thread of its own until
 /// it returns, or the window is closed (then the process exits). Call on the main thread.
