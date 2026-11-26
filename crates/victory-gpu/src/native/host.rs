@@ -1173,7 +1173,34 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
                     dropped.push(c);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A piece refused before it is submitted never reaches the GPU, so its
+                    // bottom-of-pipe value writes would be lost with it: a queue waiting for one
+                    // then holds for good (the title reports an unsignalled cross-queue barrier
+                    // and dies). They are plain writes into title memory, so they are paid here.
+                    let mut paid = 0usize;
+                    let mut paid_writes = 0usize;
+                    for c in lists.iter().flat_map(|l| l.cmds.iter()) {
+                        if let Cmd::Fill { dst, len: n, value } = c
+                            && *n > 0
+                            && self.memory.resolve(*dst, *n as u64).is_some()
+                        {
+                            // SAFETY: the range resolves in a mapped pool, checked just now.
+                            unsafe { std::ptr::write_bytes(*dst as *mut u8, *value, *n) };
+                            paid += *n;
+                            paid_writes += 1;
+                        }
+                    }
+                    if paid > 0 {
+                        tracing::warn!(
+                            error = %e,
+                            writes = paid_writes,
+                            bytes = paid,
+                            "a refused piece's value writes were paid from the CPU"
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
 
