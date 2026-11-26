@@ -906,8 +906,12 @@ impl GraphicsBackend for Metal {
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
             };
             if let Err(e) = encoded {
-                refused = Some(e);
-                break;
+                // A pass that cannot be encoded (a render target with no attachments, a piece
+                // whose root arguments were never set) is dropped; the passes after it still run,
+                // so one bad pass does not cost the frame's whole picture.
+                if refused.is_none() {
+                    refused = Some(e);
+                }
             }
         }
         if set_on_queue {
