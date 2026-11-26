@@ -256,6 +256,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released the heap whose descriptors start at `start`.
     pub fn drop_heap(&self, start: u64) {
         self.heaps.borrow_mut().retain(|h| h.start != start);
+        // Owner entries hold the heap alive; a dropped heap must not stay alive behind them.
+        self.owners.borrow_mut().retain(|_, list| {
+            list.retain(|(h, _, _)| h.start != start);
+            !list.is_empty()
+        });
     }
 
     /// The title released resource object `key`: later views naming it decode to nothing.
