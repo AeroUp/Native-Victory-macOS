@@ -210,6 +210,14 @@ pub enum Cmd<B: GraphicsBackend> {
         len: usize,
         value: u8,
     },
+    /// A region of one texture into another texture.
+    CopyTexture {
+        src: Rc<B::Texture>,
+        dst: Rc<B::Texture>,
+        src_origin: [u32; 3],
+        dst_origin: [u32; 3],
+        extent: [u32; 3],
+    },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
         depth: Option<DepthClear<B::Texture>>,
@@ -255,6 +263,19 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
             Cmd::Clear { color, depth } => Cmd::Clear {
                 color: color.clone(),
                 depth: depth.clone(),
+            },
+            Cmd::CopyTexture {
+                src,
+                dst,
+                src_origin,
+                dst_origin,
+                extent,
+            } => Cmd::CopyTexture {
+                src: src.clone(),
+                dst: dst.clone(),
+                src_origin: *src_origin,
+                dst_origin: *dst_origin,
+                extent: *extent,
             },
             Cmd::Draw {
                 pso,
@@ -377,6 +398,25 @@ impl<B: GraphicsBackend> NativeList<B> {
         for (i, b) in value.to_le_bytes().iter().take(bytes).enumerate() {
             self.fill(at + i as u64, 1, *b);
         }
+    }
+
+    /// A region of one texture into another texture (`CopyTextureRegion` between two textures): a
+    /// blit, in order with the passes around it.
+    pub fn copy_texture(
+        &mut self,
+        dst: Rc<B::Texture>,
+        src: Rc<B::Texture>,
+        dst_origin: [u32; 3],
+        src_origin: [u32; 3],
+        extent: [u32; 3],
+    ) {
+        self.cmds.push(Cmd::CopyTexture {
+            src,
+            dst,
+            src_origin,
+            dst_origin,
+            extent,
+        });
     }
 
     /// `SetDescriptorHeaps`.

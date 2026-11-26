@@ -544,7 +544,7 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
 }
 
 /// A GPU-side buffer operation on title memory (`CopyBufferRegion`, a fill), ordered with the passes around it.
-pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
+pub enum BlitOp<'a, B: ComputeBackend + ResourceBackend + ?Sized> {
     Copy {
         src: (&'a B::Buffer, *const u8),
         dst: (&'a B::Buffer, *const u8),
@@ -554,6 +554,14 @@ pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
         dst: (&'a B::Buffer, *const u8),
         len: usize,
         value: u8,
+    },
+    /// A region of one texture copied into another: a resolve, or a copy the title asked for.
+    CopyTexture {
+        src: &'a B::Texture,
+        dst: &'a B::Texture,
+        src_origin: [u32; 3],
+        dst_origin: [u32; 3],
+        extent: [u32; 3],
     },
 }
 

@@ -779,7 +779,15 @@ extern "system" fn copy_texture_region(
     #[cfg(target_os = "macos")]
     // SAFETY: the title passes both locations (null is tolerated).
     if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
-        crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+        // Type 0 is a texture with a subresource index; type 1 a placed footprint (a buffer), which
+        // this path does not do.
+        if d.kind == 0 && s.kind == 0 {
+            // SAFETY: a null box means the whole of the destination, which the callee handles.
+            let box_ = unsafe { source_box.as_ref().copied() };
+            crate::native::glue::copy_texture(this, d.resource, [x, y, z], s.resource, box_);
+        } else {
+            crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+        }
     }
     #[cfg(windows)]
     {

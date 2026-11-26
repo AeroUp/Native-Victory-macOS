@@ -1094,6 +1094,40 @@ impl Metal {
                     let o = off(dst.0, dst.1);
                     e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
                 }
+                BlitOp::CopyTexture {
+                    src,
+                    dst,
+                    src_origin,
+                    dst_origin,
+                    extent,
+                } => {
+                    // A copy is level 0, slice 0 on both sides: the title copies whole images, and
+                    // a subresource index would name another slice of a texture array.
+                    let origin = |o: &[u32; 3]| MTLOrigin {
+                        x: o[0] as usize,
+                        y: o[1] as usize,
+                        z: o[2] as usize,
+                    };
+                    // SAFETY: the regions lie inside both textures (the caller decoded the title's
+                    // box against them); `MTLOrigin` and `MTLSize` are plain values.
+                    unsafe {
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            &src.tex,
+                            0,
+                            0,
+                            origin(src_origin),
+                            MTLSize {
+                                width: extent[0] as usize,
+                                height: extent[1] as usize,
+                                depth: extent[2].max(1) as usize,
+                            },
+                            &dst.tex,
+                            0,
+                            0,
+                            origin(dst_origin),
+                        )
+                    };
+                }
             }
         }
         if let Some((f, started)) = order {

@@ -1195,6 +1195,56 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
     });
 }
 
+/// `CopyTextureRegion` between two title textures: a blit on the GPU, in order with the passes
+/// around it. `dst_origin` is where the box lands; `box_` is the source region (`left, top,
+/// front, right, bottom, back`), or null for the whole of the destination.
+pub(crate) fn copy_texture(
+    this: This,
+    dst: This,
+    dst_origin: [u32; 3],
+    src: This,
+    box_: Option<[u32; 6]>,
+) {
+    let (Some(to), Some(from)) = (
+        crate::resource::texture_info(dst),
+        crate::resource::texture_info(src),
+    ) else {
+        dropped_op("CopyTextureRegion", dst, src);
+        return;
+    };
+    let extent = box_.map_or([to.width, to.height, to.depth_or_layers.max(1)], |b| {
+        [
+            b[3].saturating_sub(b[0]),
+            b[4].saturating_sub(b[1]),
+            b[5].saturating_sub(b[2]),
+        ]
+    });
+    let src_origin = box_.map_or([0, 0, 0], |b| [b[0], b[1], b[2]]);
+    // A copy past either edge is clamped to what both textures have: Metal asserts on a region
+    // that leaves the texture, and the console clips the same way.
+    let extent = [
+        extent[0].min(to.width.saturating_sub(dst_origin[0])).min(from.width.saturating_sub(src_origin[0])),
+        extent[1].min(to.height.saturating_sub(dst_origin[1])).min(from.height.saturating_sub(src_origin[1])),
+        extent[2]
+            .min(to.depth_or_layers.max(1).saturating_sub(dst_origin[2]))
+            .min(from.depth_or_layers.max(1).saturating_sub(src_origin[2])),
+    ];
+    if extent.contains(&0) {
+        dropped_op("CopyTextureRegion (empty)", dst, src);
+        return;
+    }
+    let recorded = with_list(this, |t, l| {
+        let (Some(to), Some(from)) = (t.texture_of(dst as usize), t.texture_of(src as usize)) else {
+            return false;
+        };
+        l.list.copy_texture(to, from, dst_origin, src_origin, extent);
+        true
+    });
+    if recorded != Some(true) {
+        dropped_op("CopyTextureRegion (no host texture)", dst, src);
+    }
+}
+
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if std::env::var_os("VICTORY_TRACE_HOLD").is_some() {

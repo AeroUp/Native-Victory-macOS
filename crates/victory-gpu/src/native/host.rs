@@ -973,6 +973,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 p.blit.push(self.resolve(*dst, *len as u64)?);
             }
             Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
+            // Both textures are already host ones (made when the title recorded the copy).
+            Cmd::CopyTexture { .. } => {}
             Cmd::Clear { .. } => {}
         }
         Ok(p)
@@ -997,7 +999,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
         let same = |a: &Cmd<B>, b: &Cmd<B>| match (a, b) {
             (Cmd::Dispatch { .. }, Cmd::Dispatch { .. }) => true,
-            (Cmd::Copy { .. } | Cmd::Fill { .. }, Cmd::Copy { .. } | Cmd::Fill { .. }) => true,
+            (
+                Cmd::Copy { .. } | Cmd::Fill { .. } | Cmd::CopyTexture { .. },
+                Cmd::Copy { .. } | Cmd::Fill { .. } | Cmd::CopyTexture { .. },
+            ) => true,
             (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
             _ => false,
         };
@@ -1060,7 +1065,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             groups.push(match cmds[i] {
                 Cmd::Dispatch { .. } => Group::Compute(i, j),
-                Cmd::Copy { .. } | Cmd::Fill { .. } => Group::Blit(i, j),
+                Cmd::Copy { .. } | Cmd::Fill { .. } | Cmd::CopyTexture { .. } => Group::Blit(i, j),
                 Cmd::Draw { .. } => Group::Render(i, j),
                 Cmd::Clear { .. } => {
                     j = i + 1;
@@ -1139,6 +1144,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     value: *value,
                                 }
                             }
+                            Cmd::CopyTexture {
+                                src,
+                                dst,
+                                src_origin,
+                                dst_origin,
+                                extent,
+                            } => BlitOp::CopyTexture {
+                                src: &**src,
+                                dst: &**dst,
+                                src_origin: *src_origin,
+                                dst_origin: *dst_origin,
+                                extent: *extent,
+                            },
                             _ => unreachable!(),
                         })
                         .collect(),
