@@ -342,6 +342,34 @@ pub fn run(
             }
         });
     }
+    // A stall watchdog: no present for eight seconds is a stall, and the title's own watchdog
+    // takes the frame down a few seconds later, so dump every thread's state while it waits.
+    {
+        let _ = std::thread::Builder::new()
+            .name("victory stall watchdog".into())
+            .spawn(|| {
+                use std::time::{Duration, Instant};
+                let mut last = (u64::MAX, Instant::now());
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let frames = victory_gpu::native::PRESENTS.load(std::sync::atomic::Ordering::Relaxed);
+                    if frames != last.0 {
+                        last = (frames, Instant::now());
+                        continue;
+                    }
+                    if last.1.elapsed() < Duration::from_secs(8) {
+                        continue;
+                    }
+                    tracing::warn!(
+                        frames,
+                        seconds = last.1.elapsed().as_secs(),
+                        "no frame presented: dumping the title's threads"
+                    );
+                    victory_loader::native::dump::report_now();
+                    last = (frames, Instant::now());
+                }
+            });
+    }
     let launch = Launch(image, dlls);
     let go = move || {
         let launch = launch;

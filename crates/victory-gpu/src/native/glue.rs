@@ -393,6 +393,9 @@ pub(crate) fn present(queue: This, resource: This) {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
     });
+    if matches!(shown, Some(Ok(true))) {
+        PRESENTS.fetch_add(1, Ordering::Relaxed);
+    }
     match shown {
         Some(Err(e)) => tracing::warn!(error = %e, "a frame was not presented"),
         Some(Ok(false)) => {
@@ -406,6 +409,10 @@ pub(crate) fn present(queue: This, resource: This) {
 pub fn frames_presented() -> u64 {
     with_title(|t| t.surface().map_or(0, |s| s.frames())).unwrap_or(0)
 }
+
+/// Presents so far, without the title lock: a stall watchdog must be able to read it while the
+/// title thread holds the lock (which is where a stalled frame usually is).
+pub static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The pixels (BGRA) of the last frame presented, once the GPU has drawn it; for tests.
 pub fn last_frame() -> Option<(usize, usize, Vec<u8>)> {

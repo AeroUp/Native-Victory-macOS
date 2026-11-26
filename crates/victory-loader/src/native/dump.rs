@@ -98,6 +98,11 @@ fn claim(taken: &std::sync::atomic::AtomicBool, code: u32, unhandled: bool) -> b
     wanted && !taken.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The dump again, on demand (a stall watchdog asks for one): [`report_at_break`] takes it once.
+pub fn report_now() {
+    report();
+}
+
 fn report() {
     {
         tracing::warn!(

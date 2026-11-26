@@ -32,6 +32,7 @@ pub type Host = host::NativeHost<victory_metal::metal::Metal>;
 #[cfg(target_os = "macos")]
 pub use glue::{
     create_layer, frames_presented, last_frame, pool_observer, pools, set_event_hook, set_layer,
+    PRESENTS,
     shader_stats,
 };
 
