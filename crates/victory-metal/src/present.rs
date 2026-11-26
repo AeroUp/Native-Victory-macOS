@@ -114,8 +114,12 @@ impl Metal {
             width: width as f64,
             height: height as f64,
         });
-        // SAFETY: a plain BOOL property of CAMetalLayer.
-        let _: () = unsafe { msg_send![&*layer, setDisplaySyncEnabled: false] };
+        // The window's own size scales the drawable; the title renders at the size asked here.
+        // SAFETY: plain properties of CAMetalLayer.
+        let _: () = unsafe {
+            let _: () = msg_send![&*layer, setAutoResizeDrawable: objc2::runtime::Bool::NO];
+            msg_send![&*layer, setDisplaySyncEnabled: false]
+        };
         Layer(layer)
     }
 }

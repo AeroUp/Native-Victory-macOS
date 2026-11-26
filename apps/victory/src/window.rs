@@ -24,6 +24,12 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 pub const WIDTH: usize = 1920;
 pub const HEIGHT: usize = 1080;
 
+/// The window's size on screen, in points. The layer keeps [`WIDTH`]x[`HEIGHT`] drawables and the
+/// window scales them down, so the title still renders at its own size while the window leaves the
+/// rest of the desktop visible.
+pub const VIEW_WIDTH: usize = 1280;
+pub const VIEW_HEIGHT: usize = 720;
+
 /// Shows a window over `layer` (a `CAMetalLayer`) and runs `title` on a thread of its own until
 /// it returns, or the window is closed (then the process exits). Call on the main thread.
 pub fn run<T: Send + 'static>(
@@ -87,7 +93,7 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
 
         let rect = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(WIDTH as f64, HEIGHT as f64),
+            NSSize::new(VIEW_WIDTH as f64, VIEW_HEIGHT as f64),
         );
         // titled | closable | miniaturizable | resizable; buffered.
         let window: Retained<AnyObject> = msg_send![
