@@ -172,15 +172,18 @@ fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
-            let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
+            let mut seen: HashMap<usize, (blake3::Hash, bool)> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
             let mut rounds = 0u64;
             let mut since = std::time::Instant::now();
             let (mut bytes, mut entries) = (0u64, 0usize);
             // The whole watched set is gigabytes once the world is loaded (16 000 textures), and
             // hashing all of it every round took seconds of memory bandwidth away from the title.
-            // A quarter of it per round keeps the same latency at a fraction of the cost.
+            // A quarter of it per round keeps the same latency at a fraction of the cost, and a
+            // large texture is sampled (a few windows) on most of its turns and hashed whole every
+            // eighth, so streaming content is still seen.
             let mut cursor = 0usize;
+            let mut visits: HashMap<usize, u32> = HashMap::new();
             loop {
                 let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
@@ -188,24 +191,41 @@ fn start_scanner() {
                     let live: std::collections::HashSet<usize> =
                         list.iter().map(|&(k, _)| k).collect();
                     seen.retain(|k, _| live.contains(k));
+                    visits.retain(|k, _| live.contains(k));
                 }
                 if !list.is_empty() {
                     let batch = (list.len() / 4).max(1);
                     for i in 0..batch {
                         let (key, (at, size, target)) = list[(cursor + i) % list.len()];
-                        let mut h = blake3::Hasher::new();
-                        for off in (0..size).step_by(buf.len()) {
-                            let n = buf.len().min(size - off);
-                            buf[..n].fill(0);
-                            let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
-                            h.update(&buf[..n]);
-                        }
-                        bytes += size as u64;
+                        let n = visits.entry(key).or_insert(0);
+                        *n = n.wrapping_add(1);
+                        let whole = size <= PROBE_WHOLE || *n % 8 == 0;
+                        let h = if whole {
+                            let mut h = blake3::Hasher::new();
+                            for off in (0..size).step_by(buf.len()) {
+                                let n = buf.len().min(size - off);
+                                buf[..n].fill(0);
+                                let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+                                h.update(&buf[..n]);
+                            }
+                            bytes += size as u64;
+                            h.finalize()
+                        } else {
+                            bytes += 16;
+                            probe_hash(at, size, false, &mut buf)
+                        };
                         entries += 1;
-                        let h = h.finalize();
-                        let before = seen.insert(key, h);
-                        if before != Some(h) && !(target && before.is_none()) {
-                            watch(|w| w.dirty.insert(key));
+                        match seen.insert(key, (h, whole)) {
+                            // Compared only against a hash taken the same way.
+                            Some((before, was_whole)) if was_whole == whole && before != h => {
+                                watch(|w| w.dirty.insert(key));
+                            }
+                            Some(_) => {}
+                            None => {
+                                if !target {
+                                    watch(|w| w.dirty.insert(key));
+                                }
+                            }
                         }
                     }
                     cursor = (cursor + batch) % list.len();
