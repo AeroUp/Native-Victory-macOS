@@ -73,6 +73,12 @@
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
 //!   `i` the host keeps at the byte stride of the buffer view at heap
 //!   index `i`.
+//! * **Image stores of some channels** (added 2026-11-26). An image store
+//!   writes the channels its `dmask` enables and leaves the texel's other
+//!   channels as they were: the dmask is DXIL's texture-store write mask,
+//!   and the data registers are the enabled channels' consecutive ones (two
+//!   f16 channels per register with `d16`). A store whose dmask enables no
+//!   channel writes nothing.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
