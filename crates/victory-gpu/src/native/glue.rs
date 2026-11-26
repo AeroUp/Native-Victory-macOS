@@ -798,6 +798,19 @@ pub(crate) fn log_draw_counts(frame: u64) {
         wrapped_gb = wrapped as f64 / (1u64 << 30) as f64,
         "metal footprint"
     );
+    let r = with_title(|t| t.host.backend.residency_counts()).unwrap_or_default();
+    tracing::info!(
+        frame,
+        use_resource = r.use_resource,
+        heap_resources = r.heap_resources,
+        heap_entries = r.heap_entries,
+        heap_allocations = r.heap_allocations,
+        added = r.added,
+        queues = r.queues,
+        "heap residency"
+    );
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, "native draws so far");
+    super::descriptor_trace::log(frame);
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
