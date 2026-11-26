@@ -1083,6 +1083,19 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
+        if rp.color.is_empty() && rp.depth.is_none() {
+            // The title drew with no render targets. D3D12 runs it (it writes nothing visible);
+            // Metal needs an attachment to make an encoder, and Metal refuses one without. The
+            // pass is skipped rather than refused, so the rest of the submission still runs.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "metal: a pass with no render targets is skipped ({} draws, writes nothing)",
+                    rp.draws.len()
+                );
+            });
+            return Ok(());
+        }
         let desc = MTLRenderPassDescriptor::new();
         for (i, c) in rp.color.iter().enumerate() {
             // SAFETY: colour attachment index below 8.
